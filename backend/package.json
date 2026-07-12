@@ -1,0 +1,28 @@
+{
+  "name": "dropship-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "E-commerce dropshipping — MVP com arquitetura de monolito modular",
+  "main": "server.js",
+  "scripts": {
+    "predev": "powershell -NoProfile -Command \"$processId = (Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique); if ($processId) { Stop-Process -Id $processId -Force }\"",
+    "dev": "node -r dotenv/config server.js",
+    "sync": "node -r dotenv/config src/modules/suppliers/sync/sync-products.js",
+    "sync:pretty": "node -r dotenv/config src/modules/suppliers/sync/sync-products.js | pino-pretty",
+    "migrate": "node -r dotenv/config scripts/migrate.js",
+    "discover:sigilopay": "node -r dotenv/config scripts/discover-sigilopay-endpoints.js",
+    "test:asaas-pix": "node -r dotenv/config scripts/test-asaas-pix.js",
+    "test:checkout-pix": "node -r dotenv/config scripts/test-checkout-pix.js",
+    "test:supplier-orders-flow": "node -r dotenv/config scripts/test-supplier-orders-flow.js",
+    "test:supplier-orders-multi": "node -r dotenv/config scripts/test-supplier-orders-multi.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.12.0",
+    "pino": "^9.3.2"
+  },
+  "devDependencies": {
+    "pino-pretty": "^11.2.2"
+  }
+}
