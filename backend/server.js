@@ -6,6 +6,7 @@
  *   GET  /api/products                        → catálogo (produto + custo/margem do fornecedor primário)
  *   POST /api/checkout                        → valida e cria o pedido com snapshots (carrinho, sem gateway ainda)
  *   POST /checkout                            → checkout Pix real: pedido + cobrança Asaas + QR code
+ *   GET  /api/orders/:id/status                → status do pedido; se pending, checa a Asaas direto (fallback pro webhook)
  *   POST /webhooks/asaas                      → notificação de pagamento; cria repasse (supplier_orders) ao confirmar pagamento
  *   GET  /admin/supplier-orders/pending        → (auth: x-admin-token) lista de compras pendentes com o fornecedor
  *   POST /admin/supplier-orders/:id/mark-placed → (auth: x-admin-token) marca repasse como feito manualmente
@@ -16,7 +17,13 @@ const express = require('express');
 const { Pool } = require('pg');
 const { logger } = require('./src/shared/lib/logger');
 const { validateCheckout } = require('./src/modules/orders/service/validate-checkout');
-const { createCustomer, createPixCharge, getPixQrCode } = require('./src/modules/payments/gateway/asaas-client');
+const { markOrderPaidByPaymentId } = require('./src/modules/orders/service/mark-order-paid');
+const {
+  createCustomer,
+  createPixCharge,
+  getPixQrCode,
+  getPaymentStatus,
+} = require('./src/modules/payments/gateway/asaas-client');
 
 const app = express();
 app.use(express.json());
@@ -136,6 +143,73 @@ app.get('/api/orders', async (req, res) => {
     res.json({ orders: Array.from(ordersById.values()) });
   } catch (err) {
     req.log.error({ err }, 'Erro ao buscar pedidos por email');
+    res.status(500).json({ error: { code: 'INTERNAL' } });
+  }
+});
+
+/**
+ * Status do pedido — com fallback ativo pro webhook.
+ *
+ * Se orders.status já é 'paid', devolve direto (não gasta chamada na Asaas).
+ * Se ainda é 'pending' e o pedido tem asaas_payment_id, consulta a Asaas
+ * na hora: se ela confirmar RECEIVED/CONFIRMED mas nosso banco ainda não
+ * sabe disso (entrega do webhook atrasada, falhou, ou nunca chegou —
+ * confirmado na prática: instância que hiberna pode perder a janela de
+ * entrega), corrige o pedido aqui mesmo, reaproveitando a MESMA função
+ * que o webhook usa (markOrderPaidByPaymentId) — idempotente por
+ * construção, então não importa se o webhook chegar antes, depois, ou
+ * ao mesmo tempo que esta checagem.
+ */
+app.get('/api/orders/:id/status', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, status, asaas_payment_id FROM orders WHERE id = $1`,
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: { code: 'ORDER_NOT_FOUND' } });
+    }
+
+    const order = rows[0];
+
+    if (order.status === 'paid' || !order.asaas_payment_id) {
+      return res.json({ orderId: order.id, status: order.status });
+    }
+
+    const PAID_ASAAS_STATUSES = ['RECEIVED', 'CONFIRMED'];
+    let asaasPayment;
+    try {
+      asaasPayment = await getPaymentStatus(order.asaas_payment_id, { log: req.log });
+    } catch (err) {
+      // Asaas fora do ar/instável não pode quebrar a checagem de status —
+      // só devolve o que já sabemos localmente.
+      req.log.warn({ err, orderId: order.id }, 'Falha ao consultar status na Asaas — devolvendo status local');
+      return res.json({ orderId: order.id, status: order.status });
+    }
+
+    if (!PAID_ASAAS_STATUSES.includes(asaasPayment.status)) {
+      return res.json({ orderId: order.id, status: order.status });
+    }
+
+    // Asaas confirma pago, nosso banco ainda não sabia — corrige agora.
+    const result = await markOrderPaidByPaymentId(pool, order.asaas_payment_id, req.log, {
+      source: 'status-check',
+    });
+
+    if (result.outcome === 'PAID') {
+      req.log.info(
+        { event: 'ORDER_STATUS_CHECK_DETECTED_PAYMENT', orderId: order.id },
+        'Checagem ativa detectou pagamento que o webhook ainda não tinha confirmado'
+      );
+    }
+
+    const finalStatus = result.outcome === 'NOT_FOUND' ? order.status : 'paid';
+    res.json({ orderId: order.id, status: finalStatus });
+  } catch (err) {
+    req.log.error({ err, orderId: id }, 'Erro ao consultar status do pedido');
     res.status(500).json({ error: { code: 'INTERNAL' } });
   }
 });
@@ -470,74 +544,15 @@ app.post('/webhooks/asaas', async (req, res) => {
     return res.status(200).json({ ok: true });
   }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    const result = await markOrderPaidByPaymentId(pool, payment.id, req.log, { source: 'webhook' });
 
-    // UPDATE guardado por "status = 'pending'" é a fonte da verdade sobre
-    // se este webhook efetivamente mudou algo — evita depender de um
-    // SELECT anterior, que teria uma janela de corrida entre ler e escrever.
-    const { rows: updatedRows } = await client.query(
-      `UPDATE orders SET status = 'paid'
-        WHERE asaas_payment_id = $1 AND status = 'pending'
-        RETURNING id`,
-      [payment.id]
-    );
-
-    if (updatedRows.length > 0) {
-      const orderId = updatedRows[0].id;
-
-      // Repasse ao fornecedor: um supplier_orders por fornecedor envolvido
-      // no pedido (normalmente só um — a Alpha Star — mas o schema já
-      // suporta split entre vários). cost_cents vem do supplier_products
-      // ATUAL, nunca do snapshot em order_items: o fornecedor pode ter
-      // mudado o preço entre a compra e a confirmação do pagamento, e
-      // esse valor precisa refletir quanto vai custar repor AGORA. Inclui
-      // supplier_shipping_cents — mesmo cálculo do /api/checkout antigo,
-      // pra representar o custo real que será pago ao fornecedor.
-      const { rows: supplierCosts } = await client.query(
-        `SELECT sp.supplier_id,
-                SUM((sp.cost_cents + sp.supplier_shipping_cents) * oi.quantity) AS cost_cents
-           FROM order_items oi
-           JOIN supplier_products sp
-             ON sp.product_id = oi.product_id AND sp.is_primary = true
-          WHERE oi.order_id = $1
-          GROUP BY sp.supplier_id`,
-        [orderId]
-      );
-
-      for (const row of supplierCosts) {
-        await client.query(
-          `INSERT INTO supplier_orders (order_id, supplier_id, status, cost_cents)
-           VALUES ($1, $2, 'pending', $3)`,
-          [orderId, row.supplier_id, row.cost_cents]
-        );
-      }
-
-      await client.query('COMMIT');
-
+    if (result.outcome === 'PAID') {
       req.log.info(
-        {
-          event: 'ORDER_PAID',
-          orderId,
-          paymentId: payment.id,
-          asaasEvent,
-          supplierOrdersCreated: supplierCosts.length,
-        },
-        'Pedido marcado como pago via webhook do Asaas — repasse ao fornecedor criado'
+        { event: 'ASAAS_WEBHOOK_ORDER_PAID', orderId: result.orderId, paymentId: payment.id, asaasEvent },
+        'Webhook do Asaas confirmou pagamento — pedido marcado como pago'
       );
-      return res.status(200).json({ ok: true });
-    }
-
-    // UPDATE não afetou nenhuma linha — descobre por quê, só pra logar direito.
-    const { rows: existingRows } = await client.query(
-      'SELECT id, status FROM orders WHERE asaas_payment_id = $1',
-      [payment.id]
-    );
-
-    await client.query('COMMIT');
-
-    if (existingRows.length === 0) {
+    } else if (result.outcome === 'NOT_FOUND') {
       // Não podemos fazer o Asaas re-tentar infinitamente por um pedido
       // que não existe do nosso lado — mas o warn é essencial pra investigar.
       req.log.warn(
@@ -545,16 +560,14 @@ app.post('/webhooks/asaas', async (req, res) => {
         'Webhook do Asaas recebido para um payment_id sem pedido correspondente'
       );
     } else {
-      // Idempotência: webhook duplicado, ou pedido já pago por outro
-      // caminho — ignora silenciosamente, sem tratar como erro. Como
-      // supplier_orders só é criado no ramo acima (que só roda quando o
-      // UPDATE de fato muda pending → paid), não há risco de duplicar
-      // o repasse num webhook repetido.
+      // ALREADY_PAID: webhook duplicado, ou pedido já foi marcado como
+      // pago por outro caminho (ex: GET /api/orders/:id/status detectou
+      // primeiro) — ignora silenciosamente, sem tratar como erro.
       req.log.info(
         {
           event: 'ASAAS_WEBHOOK_IGNORED',
-          orderId: existingRows[0].id,
-          currentStatus: existingRows[0].status,
+          orderId: result.orderId,
+          currentStatus: result.status,
           paymentId: payment.id,
         },
         'Webhook do Asaas ignorado: pedido não está mais pending'
@@ -563,11 +576,8 @@ app.post('/webhooks/asaas', async (req, res) => {
 
     res.status(200).json({ ok: true });
   } catch (err) {
-    await client.query('ROLLBACK');
     req.log.error({ err, paymentId: payment.id }, 'Erro ao processar webhook do Asaas');
     res.status(500).json({ error: { code: 'INTERNAL' } });
-  } finally {
-    client.release();
   }
 });
 
