@@ -7,6 +7,7 @@
   "scripts": {
     "predev": "powershell -NoProfile -Command \"$processId = (Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique); if ($processId) { Stop-Process -Id $processId -Force }\"",
     "dev": "node -r dotenv/config server.js",
+    "start": "node server.js",
     "sync": "node -r dotenv/config src/modules/suppliers/sync/sync-products.js",
     "sync:pretty": "node -r dotenv/config src/modules/suppliers/sync/sync-products.js | pino-pretty",
     "migrate": "node -r dotenv/config scripts/migrate.js",
