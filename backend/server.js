@@ -295,6 +295,17 @@ app.post('/api/checkout', async (req, res) => {
 });
 
 /**
+ * Sandbox e Produção são bases de cliente COMPLETAMENTE separadas na
+ * Asaas — um asaas_customer_id criado num ambiente não existe no outro.
+ * Deriva o ambiente atual de ASAAS_BASE_URL, sem hardcode: "sandbox" na
+ * URL = sandbox, qualquer outra coisa = produção.
+ */
+function getCurrentAsaasEnvironment() {
+  const baseUrl = process.env.ASAAS_BASE_URL || '';
+  return baseUrl.includes('sandbox') ? 'sandbox' : 'production';
+}
+
+/**
  * Checkout Pix (fluxo real com Asaas) — um produto por pedido.
  * Body esperado:
  * {
@@ -397,7 +408,7 @@ app.post('/checkout', async (req, res) => {
     } = await client.query(
       `INSERT INTO customers (email, name) VALUES ($1, $2)
        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-       RETURNING id, asaas_customer_id`,
+       RETURNING id, asaas_customer_id, asaas_environment`,
       [customerEmail, customerName]
     );
     customer = customerRow;
@@ -448,13 +459,35 @@ app.post('/checkout', async (req, res) => {
   // tentar de novo), mas logamos com o order.id pra dar pra investigar
   // ou retomar manualmente.
   try {
+    const currentAsaasEnvironment = getCurrentAsaasEnvironment();
     let asaasCustomerId = customer.asaas_customer_id;
+
+    // Um asaas_customer_id salvo de outro ambiente (ex: Sandbox, antes de
+    // uma virada pra produção) não existe na base de clientes do ambiente
+    // atual — reaproveitar ele falha na Asaas com "invalid_customer".
+    // Trata como se não existisse: cria um cliente novo no ambiente certo.
+    if (asaasCustomerId && customer.asaas_environment !== currentAsaasEnvironment) {
+      req.log.warn(
+        {
+          event: 'ASAAS_CUSTOMER_ENVIRONMENT_MISMATCH',
+          customerId: customer.id,
+          staleEnvironment: customer.asaas_environment,
+          currentEnvironment: currentAsaasEnvironment,
+        },
+        'asaas_customer_id salvo pertence a outro ambiente — criando cliente novo'
+      );
+      asaasCustomerId = null;
+    }
+
     if (!asaasCustomerId) {
       asaasCustomerId = await createCustomer(
         { name: customerName, cpfCnpj: customerCpfCnpj, email: customerEmail },
         { log: req.log }
       );
-      await pool.query(`UPDATE customers SET asaas_customer_id = $1 WHERE id = $2`, [asaasCustomerId, customer.id]);
+      await pool.query(
+        `UPDATE customers SET asaas_customer_id = $1, asaas_environment = $2 WHERE id = $3`,
+        [asaasCustomerId, currentAsaasEnvironment, customer.id]
+      );
     }
 
     const charge = await createPixCharge(
