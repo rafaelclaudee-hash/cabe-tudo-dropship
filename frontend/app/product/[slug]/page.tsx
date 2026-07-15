@@ -50,6 +50,7 @@ export default function ProductPage({ params }: { params: { slug: string } }) {
   return (
     <main className="page">
       <Link href="/" className="btn-back">← Voltar para produtos</Link>
+      <div className="image-placeholder image-placeholder--standalone">Foto do produto</div>
       <h1>{product.name}</h1>
       <p className="price">
         R$ {(product.sale_price_cents / 100).toFixed(2).replace('.', ',')}
