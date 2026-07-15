@@ -20,3 +20,6 @@ backend/server.log
 
 # Config local do Claude Code (cache de permissões desta máquina, não do projeto)
 **/.claude/settings.local.json
+
+# Local secrets - NEVER commit
+.local-secrets/
