@@ -51,8 +51,6 @@ a {
 }
 
 .site-header__inner {
-  max-width: 960px;
-  margin: 0 auto;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -63,22 +61,41 @@ a {
 .site-header__brand {
   text-decoration: none;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  gap: 12px;
+}
+
+.site-header__logo-image {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+/* logo.png tem margem branca ao redor do símbolo — exibe maior que o
+   contêiner (70px num contêiner de 40px) e deixa o overflow:hidden
+   cortar a margem, em vez de mostrar o quadrado branco inteiro. */
+.site-header__logo-image img {
+  width: 70px;
+  height: 70px;
+  object-fit: cover;
 }
 
 .site-header__logo {
   font-family: var(--font-heading);
   font-size: 1.6rem;
   font-weight: 700;
-  color: var(--color-orange);
+  color: rgba(255, 255, 255, 1);
   letter-spacing: -0.01em;
+  transition: color 0.15s ease;
 }
 
-.site-header__tagline {
-  font-size: 0.85rem;
-  color: var(--color-cream);
-  opacity: 0.9;
+.site-header__brand:hover .site-header__logo {
+  color: var(--color-orange);
 }
 
 .site-header__nav a {

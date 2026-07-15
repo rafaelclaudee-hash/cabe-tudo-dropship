@@ -1,6 +1,7 @@
 import './globals.css';
 import type { Metadata } from 'next';
 import { Fraunces, Work_Sans } from 'next/font/google';
+import Image from 'next/image';
 import Link from 'next/link';
 
 const fraunces = Fraunces({
@@ -26,11 +27,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <header className="site-header">
           <div className="site-header__inner">
-            <Link href="/" className="site-header__brand">
-              <span className="site-header__logo">Cabe Tudo</span>
-              <span className="site-header__tagline">
-                Chega de abrir o armário e não achar nada 😤
+            <Link href="/" className="site-header__brand" aria-label="Cabe Tudo - página inicial">
+              <span className="site-header__logo-image">
+                <Image src="/logo.png" alt="Cabe Tudo" width={70} height={70} priority quality={90} />
               </span>
+              <span className="site-header__logo">Cabe Tudo</span>
             </Link>
             <nav className="site-header__nav">
               <Link href="/">Início</Link>
