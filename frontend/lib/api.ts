@@ -17,6 +17,9 @@ export interface Product {
   name: string;
   slug: string;
   sale_price_cents: number;
+  description?: string;
+  photos?: string[];
+  featured?: boolean;
   supplier_name: string;
   avg_shipping_days: number;
 }

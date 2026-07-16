@@ -74,11 +74,23 @@ export default function Home() {
               <Link
                 key={product.slug}
                 href={`/product/${product.slug}`}
-                className="card card--product"
+                className={`card card--product${product.featured ? ' card--featured' : ''}`}
               >
-                <div className="image-placeholder">Foto do produto</div>
+                <div className="card__image">
+                  {product.featured && <span className="card__featured-tag">Destaque</span>}
+                  {product.photos && product.photos.length > 0 ? (
+                    <Image
+                      src={product.photos[0]}
+                      alt={product.name}
+                      fill
+                      sizes="(max-width: 700px) 100vw, 25vw"
+                      className="card__image-img"
+                    />
+                  ) : (
+                    <div className="image-placeholder">Foto do produto</div>
+                  )}
+                </div>
                 <div className="card__body">
-                  <span className="card__tag">Cozinha</span>
                   <h3>{product.name}</h3>
                   <span className="price">
                     R$ {(product.sale_price_cents / 100).toFixed(2).replace('.', ',')}

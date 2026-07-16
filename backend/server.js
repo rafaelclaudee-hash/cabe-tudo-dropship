@@ -56,7 +56,9 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/api/products', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT p.id, p.name, p.slug, p.sale_price_cents,
+      `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description,
+              COALESCE(p.attributes->'photos', '[]'::jsonb) AS photos,
+              COALESCE((p.attributes->>'featured')::boolean, false) AS featured,
               s.name AS supplier_name, s.avg_shipping_days
          FROM products p
          JOIN supplier_products sp ON sp.product_id = p.id AND sp.is_primary = true
@@ -76,7 +78,9 @@ app.get('/api/products/:slug', async (req, res) => {
   const { slug } = req.params;
   try {
     const { rows } = await pool.query(
-      `SELECT p.id, p.name, p.slug, p.sale_price_cents,
+      `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description,
+              COALESCE(p.attributes->'photos', '[]'::jsonb) AS photos,
+              COALESCE((p.attributes->>'featured')::boolean, false) AS featured,
               s.name AS supplier_name, s.avg_shipping_days
          FROM products p
          JOIN supplier_products sp ON sp.product_id = p.id AND sp.is_primary = true
