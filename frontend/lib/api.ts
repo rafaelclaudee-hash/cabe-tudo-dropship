@@ -20,6 +20,8 @@ export interface Product {
   description?: string;
   photos?: string[];
   featured?: boolean;
+  category?: string;
+  available: boolean;
   supplier_name: string;
   avg_shipping_days: number;
 }

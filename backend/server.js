@@ -56,14 +56,15 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/api/products', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description,
+      `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description, p.category,
               COALESCE(p.attributes->'photos', '[]'::jsonb) AS photos,
               COALESCE((p.attributes->>'featured')::boolean, false) AS featured,
+              sp.available,
               s.name AS supplier_name, s.avg_shipping_days
          FROM products p
          JOIN supplier_products sp ON sp.product_id = p.id AND sp.is_primary = true
          JOIN suppliers s ON s.id = sp.supplier_id
-        WHERE p.active = true AND sp.available = true
+        WHERE p.active = true
         ORDER BY p.created_at DESC
         LIMIT 50`
     );
@@ -78,14 +79,15 @@ app.get('/api/products/:slug', async (req, res) => {
   const { slug } = req.params;
   try {
     const { rows } = await pool.query(
-      `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description,
+      `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description, p.category,
               COALESCE(p.attributes->'photos', '[]'::jsonb) AS photos,
               COALESCE((p.attributes->>'featured')::boolean, false) AS featured,
+              sp.available,
               s.name AS supplier_name, s.avg_shipping_days
          FROM products p
          JOIN supplier_products sp ON sp.product_id = p.id AND sp.is_primary = true
          JOIN suppliers s ON s.id = sp.supplier_id
-        WHERE p.active = true AND sp.available = true AND p.slug = $1
+        WHERE p.active = true AND p.slug = $1
         LIMIT 1`,
       [slug]
     );

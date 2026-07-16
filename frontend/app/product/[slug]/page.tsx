@@ -98,11 +98,18 @@ export default function ProductPage({ params }: { params: { slug: string } }) {
       <p>
         <strong>Prazo médio de entrega:</strong> {product.avg_shipping_days} dias
       </p>
+      {!product.available && <p className="soon-notice">Em breve disponível para compra.</p>}
       {product.description && (
         <p className="product-description">{product.description}</p>
       )}
       <div className="product-cta-group">
-        <Link href={`/checkout?product=${product.slug}`} className="btn">Ir para checkout</Link>
+        {product.available ? (
+          <Link href={`/checkout?product=${product.slug}`} className="btn">Ir para checkout</Link>
+        ) : (
+          <button type="button" className="btn btn--disabled" disabled>
+            Em breve
+          </button>
+        )}
         <a
           href={`https://wa.me/5553984750216?text=${whatsappMessage}`}
           target="_blank"

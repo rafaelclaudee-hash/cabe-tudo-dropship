@@ -61,9 +61,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <div>
               <h4>Produtos</h4>
               <ul>
-                <li><Link href="/">Cozinha</Link></li>
-                <li><Link href="/">Banheiro</Link></li>
-                <li><Link href="/">Organização</Link></li>
+                <li><Link href="/?categoria=cozinha">Cozinha</Link></li>
+                <li><Link href="/?categoria=banheiro">Banheiro</Link></li>
+                <li><Link href="/?categoria=organizacao">Organização</Link></li>
               </ul>
             </div>
 

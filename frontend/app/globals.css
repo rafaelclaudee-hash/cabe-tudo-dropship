@@ -386,6 +386,47 @@ a {
   border-radius: 999px;
 }
 
+.card--soon {
+  cursor: default;
+}
+
+.card--soon:hover {
+  transform: none;
+  box-shadow: var(--shadow-card);
+  border-color: var(--color-border);
+}
+
+.card__soon-tag {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 1;
+  background: #4a4a4a;
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+
+.btn--disabled:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.card__body .btn--disabled:disabled {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.soon-notice {
+  color: #4a4a4a;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
 .price {
   display: block;
   color: var(--color-orange-dark);
