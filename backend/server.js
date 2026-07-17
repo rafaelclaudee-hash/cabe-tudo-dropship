@@ -468,6 +468,18 @@ app.post('/checkout', async (req, res) => {
 
   const totalCents = product.sale_price_cents * quantity;
 
+  // A Asaas rejeita qualquer cobrança abaixo de R$ 5,00 (confirmado em
+  // produção: "o valor da cobrança menos o desconto não pode ser menor
+  // que R$ 5,00"), nos 3 métodos. Checa ANTES de criar o pedido — senão
+  // fica um pedido 'pending' no banco sem cobrança nenhuma (órfão) toda
+  // vez que a Asaas rejeitar por valor baixo.
+  const ASAAS_MIN_CHARGE_CENTS = 500;
+  if (totalCents < ASAAS_MIN_CHARGE_CENTS) {
+    return res.status(400).json({
+      error: { code: 'BELOW_MINIMUM_CHARGE', message: 'Valor mínimo de cobrança: R$ 5,00' },
+    });
+  }
+
   // 2) Cliente + 3) Pedido: só banco, então fica numa transação. As
   // chamadas ao Asaas ficam DE FORA (a partir daqui) — são HTTP externo,
   // não devem segurar uma conexão do pool nem uma transação aberta.
