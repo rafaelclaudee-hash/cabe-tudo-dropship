@@ -7,6 +7,7 @@
  *   POST /api/checkout                        → valida e cria o pedido com snapshots (carrinho, sem gateway ainda)
  *   POST /checkout                            → checkout Pix real: pedido + cobrança Asaas + QR code
  *   GET  /api/orders/:id/status                → status do pedido; se pending, checa a Asaas direto (fallback pro webhook)
+ *   GET  /api/orders/tracking/:orderId         → rastreio público (página /rastrear) — sem dados sensíveis
  *   POST /webhooks/asaas                      → notificação de pagamento; cria repasse (supplier_orders) ao confirmar pagamento
  *   GET  /admin/supplier-orders/pending        → (auth: x-admin-token) lista de compras pendentes com o fornecedor
  *   POST /admin/supplier-orders/:id/mark-placed → (auth: x-admin-token) marca repasse como feito manualmente
@@ -227,6 +228,67 @@ app.get('/api/orders/:id/status', async (req, res) => {
     res.json({ orderId: order.id, status: finalStatus });
   } catch (err) {
     req.log.error({ err, orderId: id }, 'Erro ao consultar status do pedido');
+    res.status(500).json({ error: { code: 'INTERNAL' } });
+  }
+});
+
+const ORDER_TRACKING_UUID_FORMAT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// URL de rastreio por transportadora — dict simples, sem integração com
+// API de transportadora nenhuma (fora de escopo por ora). Carrier
+// desconhecido ou ausente = carrier_url null (front mostra "copie e
+// cole no site da transportadora").
+const CARRIER_TRACKING_URL_BUILDERS = {
+  correios: (code) => `https://rastreamento.correios.com.br/app/index.php?objetos=${code}`,
+  jadlog: (code) => `https://www.jadlog.com.br/tracking?cte=${code}`,
+  loggi: (code) => `https://www.loggi.com/rastreador/${code}`,
+};
+
+function buildCarrierTrackingUrl(carrier, trackingCode) {
+  if (!carrier || !trackingCode) return null;
+  const builder = CARRIER_TRACKING_URL_BUILDERS[carrier.toLowerCase()];
+  return builder ? builder(encodeURIComponent(trackingCode)) : null;
+}
+
+/**
+ * Rastreio público do pedido — usado pela página /rastrear. Sem
+ * autenticação: o UUID do pedido é longo e não sequencial, obscuro o
+ * bastante pra servir de "chave" (mesma lógica de /api/orders/:id/status).
+ *
+ * NUNCA retorna endereço, CPF, email ou valor — só o mínimo pro
+ * cliente saber onde o pedido está. Quem decide QUAL tela mostrar
+ * (reembolsado / enviado / pago-preparando / aguardando pagamento) é o
+ * front, a partir destes campos crus — esta rota não computa "estado".
+ */
+app.get('/api/orders/tracking/:orderId', async (req, res) => {
+  const { orderId } = req.params;
+
+  if (!ORDER_TRACKING_UUID_FORMAT.test(orderId)) {
+    return res.status(400).json({ error: { code: 'INVALID_ORDER_ID' } });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, status, tracking_code, carrier, shipped_at FROM orders WHERE id = $1`,
+      [orderId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: { code: 'ORDER_NOT_FOUND' } });
+    }
+
+    const order = rows[0];
+
+    res.json({
+      id: order.id,
+      status: order.status,
+      tracking_code: order.tracking_code,
+      carrier: order.carrier,
+      shipped_at: order.shipped_at,
+      carrier_url: buildCarrierTrackingUrl(order.carrier, order.tracking_code),
+    });
+  } catch (err) {
+    req.log.error({ err, orderId }, 'Erro ao buscar rastreio do pedido');
     res.status(500).json({ error: { code: 'INTERNAL' } });
   }
 });
