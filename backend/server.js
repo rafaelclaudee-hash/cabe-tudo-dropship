@@ -23,10 +23,18 @@ const {
   createPixCharge,
   getPixQrCode,
   getPaymentStatus,
+  createCreditCardCharge,
+  createBoletoCharge,
+  getBoletoIdentificationField,
 } = require('./src/modules/payments/gateway/asaas-client');
 
 const app = express();
 app.use(express.json());
+
+// Render (como Heroku) fica atrás de um proxy reverso — sem isso, req.ip
+// devolve o IP interno do proxy, não o do cliente. O Asaas exige o IP
+// real do comprador (remoteIp) nas cobranças de cartão pra antifraude.
+app.set('trust proxy', true);
 
 const dbUrl = process.env.DATABASE_URL || '';
 const maskedDbUrl = dbUrl.replace(/(postgresql:\/\/[^:]+:)([^@]+)(@)/, '$1****$3');
@@ -57,6 +65,7 @@ app.get('/api/products', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description, p.category,
+              p.max_installments,
               COALESCE(p.attributes->'photos', '[]'::jsonb) AS photos,
               COALESCE((p.attributes->>'featured')::boolean, false) AS featured,
               sp.available,
@@ -64,7 +73,7 @@ app.get('/api/products', async (req, res) => {
          FROM products p
          JOIN supplier_products sp ON sp.product_id = p.id AND sp.is_primary = true
          JOIN suppliers s ON s.id = sp.supplier_id
-        WHERE p.active = true
+        WHERE p.active = true AND p.hidden_from_catalog = false
         ORDER BY p.created_at DESC
         LIMIT 50`
     );
@@ -80,6 +89,7 @@ app.get('/api/products/:slug', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.description, p.category,
+              p.max_installments,
               COALESCE(p.attributes->'photos', '[]'::jsonb) AS photos,
               COALESCE((p.attributes->>'featured')::boolean, false) AS featured,
               sp.available,
@@ -311,9 +321,11 @@ function getCurrentAsaasEnvironment() {
   return baseUrl.includes('sandbox') ? 'sandbox' : 'production';
 }
 
+const VALID_PAYMENT_METHODS = ['PIX', 'CREDIT_CARD', 'BOLETO'];
+
 /**
- * Checkout Pix (fluxo real com Asaas) — um produto por pedido.
- * Body esperado:
+ * Checkout (fluxo real com Asaas) — um produto por pedido.
+ * Body esperado (comum aos 3 métodos):
  * {
  *   "customerEmail": "cliente@email.com",
  *   "customerName": "Cliente Teste",
@@ -326,12 +338,25 @@ function getCurrentAsaasEnvironment() {
  *   "shippingNeighborhood": "Centro",
  *   "shippingCity": "Curitiba",
  *   "shippingState": "PR",                 // UF, 2 letras
- *   "shippingZipCode": "80000-000"
+ *   "shippingZipCode": "80000-000",
+ *   "paymentMethod": "PIX"                 // "PIX" (default) | "CREDIT_CARD" | "BOLETO"
+ * }
+ *
+ * Campos extras quando paymentMethod = "CREDIT_CARD":
+ * {
+ *   "installments": 1,                     // 1 até products.max_installments
+ *   "cardNumber": "5162306219378829",
+ *   "cardExpiryMonth": "05",
+ *   "cardExpiryYear": "2030",
+ *   "cardCvv": "318",
+ *   "cardHolderName": "Cliente Teste",
+ *   "cardHolderPhone": "53999999999"
  * }
  *
  * Diferente de /api/checkout (carrinho com múltiplos itens, ainda sem
- * gateway plugado): esta rota cria o pedido no banco E a cobrança Pix
- * no Asaas, devolvendo o QR code pro cliente pagar.
+ * gateway plugado): esta rota cria o pedido no banco E a cobrança no
+ * Asaas, devolvendo o que o front precisa pra cada método (QR Pix,
+ * confirmação de cartão, ou boleto).
  */
 app.post('/checkout', async (req, res) => {
   const {
@@ -347,7 +372,24 @@ app.post('/checkout', async (req, res) => {
     shippingCity,
     shippingState,
     shippingZipCode,
+    paymentMethod: rawPaymentMethod,
+    installments,
+    cardNumber,
+    cardExpiryMonth,
+    cardExpiryYear,
+    cardCvv,
+    cardHolderName,
+    cardHolderPhone,
   } = req.body || {};
+
+  // Sem paymentMethod no body = PIX, pro comportamento de antes desta
+  // rota ganhar cartão/boleto continuar funcionando sem mudança nenhuma.
+  const paymentMethod = rawPaymentMethod || 'PIX';
+  if (!VALID_PAYMENT_METHODS.includes(paymentMethod)) {
+    return res.status(400).json({
+      error: { code: 'BAD_REQUEST', message: `paymentMethod precisa ser um de: ${VALID_PAYMENT_METHODS.join(', ')}` },
+    });
+  }
 
   const missing = [];
   if (!customerEmail) missing.push('customerEmail');
@@ -363,6 +405,16 @@ app.post('/checkout', async (req, res) => {
   if (!shippingZipCode) missing.push('shippingZipCode');
   // shippingComplement é o único campo de endereço opcional (nem toda
   // casa/prédio tem complemento).
+
+  if (paymentMethod === 'CREDIT_CARD') {
+    if (installments === undefined || installments === null) missing.push('installments');
+    if (!cardNumber) missing.push('cardNumber');
+    if (!cardExpiryMonth) missing.push('cardExpiryMonth');
+    if (!cardExpiryYear) missing.push('cardExpiryYear');
+    if (!cardCvv) missing.push('cardCvv');
+    if (!cardHolderName) missing.push('cardHolderName');
+    if (!cardHolderPhone) missing.push('cardHolderPhone');
+  }
 
   if (missing.length > 0) {
     return res.status(400).json({
@@ -382,11 +434,18 @@ app.post('/checkout', async (req, res) => {
     });
   }
 
-  // 1) Produto: preço SEMPRE do banco, nunca de um valor vindo do cliente.
+  if (paymentMethod === 'CREDIT_CARD' && (!Number.isInteger(installments) || installments < 1)) {
+    return res.status(400).json({
+      error: { code: 'BAD_REQUEST', message: 'installments precisa ser um número inteiro maior ou igual a 1' },
+    });
+  }
+
+  // 1) Produto: preço e limite de parcelas SEMPRE do banco, nunca de um
+  // valor vindo do cliente.
   let product;
   try {
     const { rows } = await pool.query(
-      `SELECT id, name, sale_price_cents FROM products WHERE slug = $1 AND active = true LIMIT 1`,
+      `SELECT id, name, sale_price_cents, max_installments FROM products WHERE slug = $1 AND active = true LIMIT 1`,
       [productSlug]
     );
     if (rows.length === 0) {
@@ -394,8 +453,17 @@ app.post('/checkout', async (req, res) => {
     }
     product = rows[0];
   } catch (err) {
-    req.log.error({ err }, 'Erro ao buscar produto no checkout Pix');
+    req.log.error({ err }, 'Erro ao buscar produto no checkout');
     return res.status(500).json({ error: { code: 'INTERNAL' } });
+  }
+
+  if (paymentMethod === 'CREDIT_CARD' && installments > product.max_installments) {
+    return res.status(400).json({
+      error: {
+        code: 'TOO_MANY_INSTALLMENTS',
+        message: `Este produto aceita no máximo ${product.max_installments}x`,
+      },
+    });
   }
 
   const totalCents = product.sale_price_cents * quantity;
@@ -423,14 +491,15 @@ app.post('/checkout', async (req, res) => {
       rows: [orderRow],
     } = await client.query(
       `INSERT INTO orders (
-         customer_id, status, total_cents,
+         customer_id, status, total_cents, payment_method,
          shipping_street, shipping_number, shipping_complement,
          shipping_neighborhood, shipping_city, shipping_state, shipping_zip_code
-       ) VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9)
+       ) VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
       [
         customer.id,
         totalCents,
+        paymentMethod,
         shippingStreet,
         shippingNumber,
         shippingComplement || null,
@@ -451,22 +520,23 @@ app.post('/checkout', async (req, res) => {
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
-    req.log.error({ err }, 'Erro ao criar pedido no checkout Pix');
+    req.log.error({ err }, 'Erro ao criar pedido no checkout');
     return res.status(500).json({ error: { code: 'INTERNAL' } });
   } finally {
     client.release();
   }
 
-  req.log.info({ event: 'ORDER_CREATED', orderId: order.id, totalCents }, 'Pedido criado (checkout Pix)');
+  req.log.info({ event: 'ORDER_CREATED', orderId: order.id, totalCents, paymentMethod }, 'Pedido criado');
 
-  // 4) Asaas: cliente + cobrança + QR code. O pedido JÁ existe no banco
-  // aqui — se algo falhar a partir deste ponto, ele fica 'pending' (não
-  // 'failed': o Asaas pode ter processado parcialmente, e o cliente pode
-  // tentar de novo), mas logamos com o order.id pra dar pra investigar
-  // ou retomar manualmente.
+  // 4) Asaas: cliente + cobrança. O pedido JÁ existe no banco aqui — se
+  // algo falhar a partir deste ponto, ele fica 'pending' (não 'failed':
+  // o Asaas pode ter processado parcialmente, e o cliente pode tentar
+  // de novo), mas logamos com o order.id pra dar pra investigar ou
+  // retomar manualmente.
+  let asaasCustomerId;
   try {
     const currentAsaasEnvironment = getCurrentAsaasEnvironment();
-    let asaasCustomerId = customer.asaas_customer_id;
+    asaasCustomerId = customer.asaas_customer_id;
 
     // Um asaas_customer_id salvo de outro ambiente (ex: Sandbox, antes de
     // uma virada pra produção) não existe na base de clientes do ambiente
@@ -495,33 +565,148 @@ app.post('/checkout', async (req, res) => {
         [asaasCustomerId, currentAsaasEnvironment, customer.id]
       );
     }
+  } catch (err) {
+    req.log.error(
+      { err, orderId: order.id, event: 'ORDER_ASAAS_CUSTOMER_FAILED' },
+      'Falha ao criar/recuperar cliente na Asaas — pedido permanece pending para nova tentativa'
+    );
+    return res.status(502).json({ error: { code: 'PAYMENT_GATEWAY_ERROR', orderId: order.id } });
+  }
 
-    const charge = await createPixCharge(
+  if (paymentMethod === 'PIX') {
+    try {
+      const charge = await createPixCharge(
+        { customerId: asaasCustomerId, value: totalCents / 100, description: `Pedido #${order.id}` },
+        { log: req.log }
+      );
+
+      await pool.query(`UPDATE orders SET asaas_payment_id = $1 WHERE id = $2`, [charge.id, order.id]);
+
+      const qr = await getPixQrCode(charge.id, { log: req.log });
+
+      req.log.info(
+        { event: 'ORDER_PIX_CHARGE_CREATED', orderId: order.id, paymentId: charge.id },
+        'Cobrança Pix criada para o pedido'
+      );
+
+      return res.status(201).json({
+        orderId: order.id,
+        paymentMethod: 'PIX',
+        payload: qr.payload,
+        qrCodeImage: qr.encodedImage,
+        expirationDate: qr.expirationDate,
+      });
+    } catch (err) {
+      req.log.error(
+        { err, orderId: order.id, event: 'ORDER_PIX_CHARGE_FAILED' },
+        'Falha ao gerar cobrança Pix no Asaas — pedido permanece pending para nova tentativa'
+      );
+      return res.status(502).json({ error: { code: 'PAYMENT_GATEWAY_ERROR', orderId: order.id } });
+    }
+  }
+
+  if (paymentMethod === 'CREDIT_CARD') {
+    let payment;
+    try {
+      payment = await createCreditCardCharge(
+        {
+          customerId: asaasCustomerId,
+          value: totalCents / 100,
+          description: `Pedido #${order.id}`,
+          installmentCount: installments,
+          card: {
+            number: cardNumber,
+            expiryMonth: cardExpiryMonth,
+            expiryYear: cardExpiryYear,
+            ccv: cardCvv,
+            holderName: cardHolderName,
+          },
+          holder: {
+            name: cardHolderName,
+            email: customerEmail,
+            cpfCnpj: customerCpfCnpj,
+            // Sem formulário de endereço de cobrança separado no MVP —
+            // reaproveita o endereço de entrega já coletado.
+            postalCode: shippingZipCode,
+            addressNumber: shippingNumber,
+            addressComplement: shippingComplement || null,
+            phone: cardHolderPhone,
+          },
+          remoteIp: req.ip,
+        },
+        { log: req.log }
+      );
+    } catch (err) {
+      req.log.error(
+        { err, orderId: order.id, event: 'ORDER_CARD_CHARGE_DECLINED' },
+        'Cobrança de cartão recusada ou falhou na Asaas'
+      );
+      const asaasMessage = err.body?.errors?.[0]?.description;
+      return res.status(402).json({
+        error: {
+          code: 'CARD_DECLINED',
+          message: asaasMessage || 'Cartão recusado. Confira os dados ou tente outro cartão.',
+          orderId: order.id,
+        },
+      });
+    }
+
+    await pool.query(`UPDATE orders SET asaas_payment_id = $1 WHERE id = $2`, [payment.id, order.id]);
+
+    // Cartão autoriza SÍNCRONO na criação — se já veio confirmado, marca
+    // o pedido como pago agora (mesma função idempotente do webhook),
+    // sem esperar o round-trip do webhook pra o cliente ver "pago".
+    const CONFIRMED_STATUSES = ['CONFIRMED', 'RECEIVED'];
+    let finalStatus = 'pending';
+    if (CONFIRMED_STATUSES.includes(payment.status)) {
+      const markResult = await markOrderPaidByPaymentId(pool, payment.id, req.log, { source: 'credit-card-sync' });
+      finalStatus = markResult.outcome === 'NOT_FOUND' ? 'pending' : 'paid';
+    }
+
+    req.log.info(
+      { event: 'ORDER_CARD_CHARGE_CREATED', orderId: order.id, paymentId: payment.id, asaasStatus: payment.status },
+      'Cobrança de cartão criada'
+    );
+
+    return res.status(201).json({
+      orderId: order.id,
+      paymentMethod: 'CREDIT_CARD',
+      status: finalStatus,
+      installments,
+      totalCents,
+    });
+  }
+
+  // paymentMethod === 'BOLETO'
+  try {
+    const payment = await createBoletoCharge(
       { customerId: asaasCustomerId, value: totalCents / 100, description: `Pedido #${order.id}` },
       { log: req.log }
     );
 
-    await pool.query(`UPDATE orders SET asaas_payment_id = $1 WHERE id = $2`, [charge.id, order.id]);
+    await pool.query(`UPDATE orders SET asaas_payment_id = $1 WHERE id = $2`, [payment.id, order.id]);
 
-    const qr = await getPixQrCode(charge.id, { log: req.log });
+    const { identificationField, barCode } = await getBoletoIdentificationField(payment.id, { log: req.log });
 
     req.log.info(
-      { event: 'ORDER_PIX_CHARGE_CREATED', orderId: order.id, paymentId: charge.id },
-      'Cobrança Pix criada para o pedido'
+      { event: 'ORDER_BOLETO_CHARGE_CREATED', orderId: order.id, paymentId: payment.id },
+      'Cobrança de boleto criada'
     );
 
-    res.status(201).json({
+    return res.status(201).json({
       orderId: order.id,
-      payload: qr.payload,
-      qrCodeImage: qr.encodedImage,
-      expirationDate: qr.expirationDate,
+      paymentMethod: 'BOLETO',
+      bankSlipUrl: payment.bankSlipUrl,
+      identificationField,
+      barCode,
+      dueDate: payment.dueDate,
     });
   } catch (err) {
     req.log.error(
-      { err, orderId: order.id, event: 'ORDER_PIX_CHARGE_FAILED' },
-      'Falha ao gerar cobrança Pix no Asaas — pedido permanece pending para nova tentativa'
+      { err, orderId: order.id, event: 'ORDER_BOLETO_CHARGE_FAILED' },
+      'Falha ao gerar cobrança de boleto no Asaas — pedido permanece pending para nova tentativa'
     );
-    res.status(502).json({ error: { code: 'PAYMENT_GATEWAY_ERROR', orderId: order.id } });
+    return res.status(502).json({ error: { code: 'PAYMENT_GATEWAY_ERROR', orderId: order.id } });
   }
 });
 
@@ -578,8 +763,34 @@ app.post('/webhooks/asaas', async (req, res) => {
   );
 
   const PAID_EVENTS = ['PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'];
+  const OVERDUE_EVENTS = ['PAYMENT_OVERDUE'];
+
+  // Boleto vencido sem pagamento — só transiciona pending → overdue
+  // (idempotente: se o pedido já foi pago por outro caminho, não mexe).
+  if (OVERDUE_EVENTS.includes(asaasEvent) && payment?.id) {
+    try {
+      const { rows } = await pool.query(
+        `UPDATE orders SET status = 'overdue'
+          WHERE asaas_payment_id = $1 AND status = 'pending'
+          RETURNING id`,
+        [payment.id]
+      );
+
+      if (rows.length > 0) {
+        req.log.info(
+          { event: 'ASAAS_WEBHOOK_ORDER_OVERDUE', orderId: rows[0].id, paymentId: payment.id },
+          'Boleto vencido sem pagamento — pedido marcado como overdue'
+        );
+      }
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      req.log.error({ err, paymentId: payment.id }, 'Erro ao marcar pedido como overdue');
+      return res.status(500).json({ error: { code: 'INTERNAL' } });
+    }
+  }
+
   if (!PAID_EVENTS.includes(asaasEvent) || !payment?.id) {
-    // Evento que não nos interessa ainda (ex: PAYMENT_OVERDUE) — só confirma.
+    // Evento que não nos interessa (ex: PAYMENT_DELETED) — só confirma.
     return res.status(200).json({ ok: true });
   }
 

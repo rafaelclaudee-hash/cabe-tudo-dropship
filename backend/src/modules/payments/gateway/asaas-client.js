@@ -1,19 +1,21 @@
 /**
- * Cliente HTTP do Asaas (gateway de pagamentos) — ambiente Sandbox
+ * Cliente HTTP do Asaas (gateway de pagamentos)
  * ------------------------------------------------------------------
  * Autenticação: header `access_token` com a chave de API crua (NÃO é
  * "Bearer <token>" como a maioria das APIs — o Asaas quer o valor puro).
  *
- * Base URL vem de ASAAS_BASE_URL (hoje apontando pro Sandbox:
- * https://api-sandbox.asaas.com/v3). Trocar para produção é só trocar
- * essa variável — o código não hardcoda ambiente nenhum.
+ * Base URL vem de ASAAS_BASE_URL. HOJE aponta pra PRODUÇÃO
+ * (https://api.asaas.com/v3) — cobranças criadas por este módulo são
+ * reais. Trocar de ambiente é só trocar essa variável — o código não
+ * hardcoda ambiente nenhum (ver getCurrentAsaasEnvironment em server.js).
  *
  * Camadas deste arquivo:
  *   1. asaasRequest/asaasClient — fundação genérica (get/post autenticados),
  *      mesmo padrão do sigilopay-client.js: timeout, log estruturado,
  *      corpo não-JSON não derruba o parse antes de vermos o status.
- *   2. createCustomer/createPixCharge/getPixQrCode — funções de domínio
- *      específicas do fluxo Pix, construídas em cima da camada 1.
+ *   2. createCustomer/createPixCharge/getPixQrCode/createCreditCardCharge/
+ *      createBoletoCharge/getBoletoIdentificationField — funções de
+ *      domínio (Pix, cartão, boleto), construídas em cima da camada 1.
  *
  * Sem retry automático: POST retentado sem controle pode criar cliente
  * ou cobrança duplicada. Quem chamar decide se/como re-tentar.
@@ -112,6 +114,25 @@ function todayDateString() {
 }
 
 /**
+ * Data (YYYY-MM-DD) N dias ÚTEIS a partir de hoje (pula sábado/domingo;
+ * feriados não entram na conta — suficiente pro MVP, sem tabela de
+ * feriados). Usado como vencimento padrão do boleto.
+ */
+function businessDaysFromTodayDateString(days) {
+  const date = new Date();
+  let added = 0;
+  while (added < days) {
+    date.setDate(date.getDate() + 1);
+    const dayOfWeek = date.getDay(); // 0 = domingo, 6 = sábado
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) added++;
+  }
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/**
  * Cria um cliente no Asaas.
  * @param {object} params
  * @param {string} params.name
@@ -178,7 +199,123 @@ async function getPaymentStatus(paymentId, opts) {
   return body;
 }
 
-module.exports = { asaasClient, createCustomer, createPixCharge, getPixQrCode, getPaymentStatus };
+/**
+ * Cria uma cobrança de cartão de crédito. Diferente do Pix, a
+ * autorização é tentada de forma SÍNCRONA na criação: se aprovada, a
+ * Asaas já devolve o payment com status CONFIRMED/RECEIVED nesta mesma
+ * chamada (sem precisar esperar o webhook). Se recusada, a chamada
+ * inteira rejeita — err.status/err.body trazem o motivo (ver asaasRequest).
+ *
+ * Parcelamento sem juros pro cliente: quando installmentCount > 1,
+ * manda installmentCount + totalValue (nunca "value" junto com
+ * installmentCount — são alternativas, não complementares). A Asaas
+ * divide o totalValue em partes iguais entre as parcelas; não enviamos
+ * nenhum campo de juros/multa de parcelamento, então não há acréscimo
+ * pro cliente — a loja absorve a taxa da Asaas por fora.
+ *
+ * Endpoint: usa /payments (padrão da Asaas), diferente do /lean/payments
+ * usado pelo Pix — não existe combinação documentada de billingType
+ * CREDIT_CARD com /lean/payments, e o fluxo Pix não deve ser tocado.
+ *
+ * @param {object} params
+ * @param {string} params.customerId
+ * @param {number} params.value - valor total em REAIS (não centavos)
+ * @param {string} [params.description]
+ * @param {number} params.installmentCount - 1 = à vista, sem parcelamento
+ * @param {object} params.card - { number, expiryMonth, expiryYear, ccv, holderName }
+ * @param {object} params.holder - { name, email, cpfCnpj, postalCode, addressNumber, addressComplement, phone }
+ * @param {string} params.remoteIp - IP do comprador (obrigatório pela Asaas p/ antifraude; NUNCA o IP do servidor)
+ * @param {object} [opts] - repassado pro request (log, timeoutMs...)
+ * @returns {Promise<object>} objeto completo da cobrança (inclui .id e .status)
+ */
+async function createCreditCardCharge(
+  { customerId, value, description, installmentCount, card, holder, remoteIp },
+  opts
+) {
+  const body = {
+    billingType: 'CREDIT_CARD',
+    customer: customerId,
+    dueDate: todayDateString(),
+    description,
+    creditCard: {
+      holderName: card.holderName,
+      number: card.number,
+      expiryMonth: card.expiryMonth,
+      expiryYear: card.expiryYear,
+      ccv: card.ccv,
+    },
+    creditCardHolderInfo: {
+      name: holder.name,
+      email: holder.email,
+      cpfCnpj: holder.cpfCnpj,
+      postalCode: holder.postalCode,
+      addressNumber: holder.addressNumber,
+      addressComplement: holder.addressComplement || null,
+      phone: holder.phone,
+      mobilePhone: holder.phone,
+    },
+    remoteIp,
+  };
+
+  if (installmentCount > 1) {
+    body.installmentCount = installmentCount;
+    body.totalValue = value;
+  } else {
+    body.value = value;
+  }
+
+  const { body: payment } = await asaasClient.post('/payments', body, opts);
+  return payment;
+}
+
+/**
+ * Cria uma cobrança de boleto. Vencimento padrão: 3 dias úteis a
+ * partir de hoje.
+ * @param {object} params
+ * @param {string} params.customerId
+ * @param {number} params.value - valor em REAIS (não centavos)
+ * @param {string} [params.description]
+ * @param {object} [opts] - repassado pro request (log, timeoutMs...)
+ * @returns {Promise<object>} objeto completo da cobrança (inclui .id e .bankSlipUrl)
+ */
+async function createBoletoCharge({ customerId, value, description }, opts) {
+  const { body: payment } = await asaasClient.post(
+    '/payments',
+    {
+      billingType: 'BOLETO',
+      customer: customerId,
+      value,
+      dueDate: businessDaysFromTodayDateString(3),
+      description,
+    },
+    opts
+  );
+  return payment;
+}
+
+/**
+ * Busca a linha digitável e o código de barras de um boleto já criado
+ * (a criação devolve bankSlipUrl direto, mas linha digitável/código de
+ * barras exigem esta chamada separada).
+ * @param {string} paymentId - id retornado por createBoletoCharge
+ * @param {object} [opts] - repassado pro request (log, timeoutMs...)
+ * @returns {Promise<{identificationField: string, barCode: string}>}
+ */
+async function getBoletoIdentificationField(paymentId, opts) {
+  const { body } = await asaasClient.get(`/payments/${paymentId}/identificationField`, opts);
+  return { identificationField: body.identificationField, barCode: body.barCode };
+}
+
+module.exports = {
+  asaasClient,
+  createCustomer,
+  createPixCharge,
+  getPixQrCode,
+  getPaymentStatus,
+  createCreditCardCharge,
+  createBoletoCharge,
+  getBoletoIdentificationField,
+};
 
 /* ------------------------------------------------------------------
  * USO (esboço — nenhuma rota HTTP chama isto ainda):

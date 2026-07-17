@@ -9,7 +9,9 @@
  *   - GET /api/products/:slug → busca um produto por slug
  *   - GET /api/orders?email=X → lista pedidos do cliente
  *   - POST /api/checkout      → mock antigo, não usar (ver createOrder)
- *   - POST /api/checkout-pix  → checkout Pix real (pedido + cobrança Asaas)
+ *   - POST /api/checkout-pix  → checkout real (pedido + cobrança Asaas:
+ *                               Pix, cartão de crédito ou boleto — nome
+ *                               da rota ficou de quando só existia Pix)
  */
 
 export interface Product {
@@ -22,6 +24,7 @@ export interface Product {
   featured?: boolean;
   category?: string;
   available: boolean;
+  max_installments: number;
   supplier_name: string;
   avg_shipping_days: number;
 }
@@ -108,7 +111,9 @@ export async function createOrder(customerEmail: string, items: any[]) {
   return response.json();
 }
 
-export interface PixCheckoutParams {
+export type PaymentMethod = 'PIX' | 'CREDIT_CARD' | 'BOLETO';
+
+export interface CheckoutParams {
   customerEmail: string;
   customerName: string;
   customerCpfCnpj: string;
@@ -121,19 +126,49 @@ export interface PixCheckoutParams {
   shippingCity: string;
   shippingState: string;
   shippingZipCode: string;
+  paymentMethod: PaymentMethod;
+  // Só quando paymentMethod === 'CREDIT_CARD'
+  installments?: number;
+  cardNumber?: string;
+  cardExpiryMonth?: string;
+  cardExpiryYear?: string;
+  cardCvv?: string;
+  cardHolderName?: string;
+  cardHolderPhone?: string;
 }
 
 export interface PixCheckoutResult {
   orderId: string;
+  paymentMethod: 'PIX';
   payload: string;
   qrCodeImage: string;
   expirationDate: string;
 }
 
+export interface CreditCardCheckoutResult {
+  orderId: string;
+  paymentMethod: 'CREDIT_CARD';
+  status: string;
+  installments: number;
+  totalCents: number;
+}
+
+export interface BoletoCheckoutResult {
+  orderId: string;
+  paymentMethod: 'BOLETO';
+  bankSlipUrl: string;
+  identificationField: string;
+  barCode: string;
+  dueDate: string;
+}
+
+export type CheckoutResult = PixCheckoutResult | CreditCardCheckoutResult | BoletoCheckoutResult;
+
 /**
- * Cria o pedido e a cobrança Pix de verdade (gateway Asaas).
+ * Cria o pedido e a cobrança de verdade (gateway Asaas) — Pix, cartão
+ * de crédito ou boleto, de acordo com params.paymentMethod.
  */
-export async function createPixCheckout(params: PixCheckoutParams): Promise<PixCheckoutResult> {
+export async function createCheckout(params: CheckoutParams): Promise<CheckoutResult> {
   const response = await fetch(`/api/checkout-pix`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -149,7 +184,7 @@ export async function createPixCheckout(params: PixCheckoutParams): Promise<PixC
       (typeof data?.error === 'string' && data.error) ||
       data?.error?.message ||
       data?.error?.code ||
-      `Erro ao criar checkout Pix (${response.status})`;
+      `Erro ao criar checkout (${response.status})`;
     throw new Error(message);
   }
 
