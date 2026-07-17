@@ -135,6 +135,14 @@ export interface CheckoutParams {
   cardCvv?: string;
   cardHolderName?: string;
   cardHolderPhone?: string;
+  // Atribuição de campanha (lida do cookie de UTM, ver lib/utm.ts)
+  utmSource?: string;
+  utmCampaign?: string;
+  utmMedium?: string;
+  utmContent?: string;
+  utmTerm?: string;
+  src?: string;
+  sck?: string;
 }
 
 export interface PixCheckoutResult {

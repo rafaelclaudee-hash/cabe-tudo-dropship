@@ -10,6 +10,7 @@ import {
   type PaymentMethod,
   type CheckoutResult,
 } from '@/lib/api';
+import { readUtmCookie } from '@/lib/utm';
 
 function formatCentsToBRL(cents: number) {
   return `R$ ${(cents / 100).toFixed(2).replace('.', ',')}`;
@@ -159,6 +160,8 @@ function CheckoutContent() {
     setSubmitError(null);
 
     try {
+      const utm = readUtmCookie();
+
       const data = await createCheckout({
         customerEmail,
         customerName,
@@ -182,6 +185,17 @@ function CheckoutContent() {
               cardCvv,
               cardHolderName,
               cardHolderPhone: cardHolderPhone.replace(/\D/g, ''),
+            }
+          : {}),
+        ...(utm
+          ? {
+              utmSource: utm.utm_source,
+              utmCampaign: utm.utm_campaign,
+              utmMedium: utm.utm_medium,
+              utmContent: utm.utm_content,
+              utmTerm: utm.utm_term,
+              src: utm.src,
+              sck: utm.sck,
             }
           : {}),
       });

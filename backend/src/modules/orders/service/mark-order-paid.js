@@ -1,3 +1,5 @@
+const { notifyOrderStatusToUtmify } = require('../../tracking/service/notify-utmify');
+
 /**
  * MARCAR PEDIDO COMO PAGO + CRIAR REPASSE AO FORNECEDOR
  * ==================================================================
@@ -84,6 +86,11 @@ async function markOrderPaidByPaymentId(pool, paymentId, log, { source } = {}) {
         },
         'Pedido marcado como pago — repasse ao fornecedor criado'
       );
+
+      // Fora da transação (já commitada) e sem await — chamador (webhook
+      // ou checkout de cartão síncrono) não deve esperar a Utmify pra
+      // responder.
+      notifyOrderStatusToUtmify(pool, orderId, { status: 'paid', approvedDate: new Date() }, log).catch(() => {});
 
       return { outcome: 'PAID', orderId, supplierOrdersCreated: supplierCosts.length };
     }

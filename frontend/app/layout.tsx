@@ -3,6 +3,7 @@ import type { Metadata } from 'next';
 import { Fraunces, Work_Sans } from 'next/font/google';
 import Image from 'next/image';
 import Link from 'next/link';
+import UtmCapture from '@/components/UtmCapture';
 
 const fraunces = Fraunces({
   subsets: ['latin'],
@@ -25,6 +26,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="pt-BR" className={`${fraunces.variable} ${workSans.variable}`}>
       <body>
+        <UtmCapture />
         <header className="site-header">
           <div className="site-header__inner">
             <Link href="/" className="site-header__brand" aria-label="Cabe Tudo - página inicial">

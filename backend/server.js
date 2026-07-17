@@ -27,6 +27,7 @@ const {
   createBoletoCharge,
   getBoletoIdentificationField,
 } = require('./src/modules/payments/gateway/asaas-client');
+const { notifyOrderStatusToUtmify } = require('./src/modules/tracking/service/notify-utmify');
 
 const app = express();
 app.use(express.json());
@@ -380,6 +381,13 @@ app.post('/checkout', async (req, res) => {
     cardCvv,
     cardHolderName,
     cardHolderPhone,
+    utmSource,
+    utmCampaign,
+    utmMedium,
+    utmContent,
+    utmTerm,
+    src,
+    sck,
   } = req.body || {};
 
   // Sem paymentMethod no body = PIX, pro comportamento de antes desta
@@ -499,14 +507,20 @@ app.post('/checkout', async (req, res) => {
     );
     customer = customerRow;
 
+    // Telefone só existe pro checkout de cartão (formulário não pede
+    // telefone pra Pix/Boleto) — fica nulo nesses dois métodos.
+    const customerPhone = paymentMethod === 'CREDIT_CARD' ? cardHolderPhone : null;
+
     const {
       rows: [orderRow],
     } = await client.query(
       `INSERT INTO orders (
          customer_id, status, total_cents, payment_method,
          shipping_street, shipping_number, shipping_complement,
-         shipping_neighborhood, shipping_city, shipping_state, shipping_zip_code
-       ) VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         shipping_neighborhood, shipping_city, shipping_state, shipping_zip_code,
+         utm_source, utm_campaign, utm_medium, utm_content, utm_term, src, sck,
+         customer_ip, customer_cpf_cnpj, customer_phone
+       ) VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
        RETURNING id`,
       [
         customer.id,
@@ -519,6 +533,16 @@ app.post('/checkout', async (req, res) => {
         shippingCity,
         shippingState.toUpperCase(),
         shippingZipCode,
+        utmSource || null,
+        utmCampaign || null,
+        utmMedium || null,
+        utmContent || null,
+        utmTerm || null,
+        src || null,
+        sck || null,
+        req.ip,
+        customerCpfCnpj,
+        customerPhone,
       ]
     );
     order = orderRow;
@@ -539,6 +563,12 @@ app.post('/checkout', async (req, res) => {
   }
 
   req.log.info({ event: 'ORDER_CREATED', orderId: order.id, totalCents, paymentMethod }, 'Pedido criado');
+
+  // Notifica a Utmify em paralelo, sem bloquear a resposta do checkout —
+  // notifyOrderStatusToUtmify nunca lança, mas o .catch aqui é só uma
+  // segunda rede de segurança (nunca deixar uma promise solta derrubar
+  // o processo por unhandledRejection).
+  notifyOrderStatusToUtmify(pool, order.id, { status: 'waiting_payment' }, req.log).catch(() => {});
 
   // 4) Asaas: cliente + cobrança. O pedido JÁ existe no banco aqui — se
   // algo falhar a partir deste ponto, ele fica 'pending' (não 'failed':
@@ -601,12 +631,21 @@ app.post('/checkout', async (req, res) => {
         'Cobrança Pix criada para o pedido'
       );
 
+      // NÃO usar qr.expirationDate aqui: é a validade TÉCNICA do QR Code
+      // (documentado pela Asaas como vencimento + 12 meses — o QR
+      // continua escaneável bem além do prazo de pagamento), não o prazo
+      // real pro cliente pagar. O prazo real é charge.dueDate (o que a
+      // gente mandou na criação da cobrança, ecoado de volta pela Asaas).
+      // "Fim do dia" em horário de Brasília, já que dueDate vem só como
+      // data (sem hora) e o pagamento é válido até o fim daquele dia.
+      const dueDateEndOfDay = `${charge.dueDate}T23:59:59-03:00`;
+
       return res.status(201).json({
         orderId: order.id,
         paymentMethod: 'PIX',
         payload: qr.payload,
         qrCodeImage: qr.encodedImage,
-        expirationDate: qr.expirationDate,
+        expirationDate: dueDateEndOfDay,
       });
     } catch (err) {
       req.log.error(
@@ -776,9 +815,12 @@ app.post('/webhooks/asaas', async (req, res) => {
 
   const PAID_EVENTS = ['PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED'];
   const OVERDUE_EVENTS = ['PAYMENT_OVERDUE'];
+  const REFUNDED_EVENTS = ['PAYMENT_REFUNDED'];
 
   // Boleto vencido sem pagamento — só transiciona pending → overdue
   // (idempotente: se o pedido já foi pago por outro caminho, não mexe).
+  // Não notifica a Utmify: não é uma venda perdida, é uma venda que não
+  // aconteceu — a Utmify considera abandonado depois de um tempo sozinha.
   if (OVERDUE_EVENTS.includes(asaasEvent) && payment?.id) {
     try {
       const { rows } = await pool.query(
@@ -797,6 +839,33 @@ app.post('/webhooks/asaas', async (req, res) => {
       return res.status(200).json({ ok: true });
     } catch (err) {
       req.log.error({ err, paymentId: payment.id }, 'Erro ao marcar pedido como overdue');
+      return res.status(500).json({ error: { code: 'INTERNAL' } });
+    }
+  }
+
+  // Reembolso — só transiciona paid → refunded (idempotente: se não
+  // estava pago, não mexe).
+  if (REFUNDED_EVENTS.includes(asaasEvent) && payment?.id) {
+    try {
+      const { rows } = await pool.query(
+        `UPDATE orders SET status = 'refunded'
+          WHERE asaas_payment_id = $1 AND status = 'paid'
+          RETURNING id`,
+        [payment.id]
+      );
+
+      if (rows.length > 0) {
+        req.log.info(
+          { event: 'ASAAS_WEBHOOK_ORDER_REFUNDED', orderId: rows[0].id, paymentId: payment.id },
+          'Pedido reembolsado'
+        );
+        notifyOrderStatusToUtmify(pool, rows[0].id, { status: 'refunded', refundedAt: new Date() }, req.log).catch(
+          () => {}
+        );
+      }
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      req.log.error({ err, paymentId: payment.id }, 'Erro ao marcar pedido como refunded');
       return res.status(500).json({ error: { code: 'INTERNAL' } });
     }
   }
