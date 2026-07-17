@@ -50,13 +50,11 @@ async function notifyOrderStatusToUtmify(pool, orderId, { status, approvedDate, 
               o.customer_ip, o.customer_cpf_cnpj, o.customer_phone,
               c.name AS customer_name, c.email AS customer_email,
               oi.product_id, oi.product_name, oi.unit_price_cents, oi.quantity,
-              p.slug AS product_slug,
-              sp.cost_cents
+              p.slug AS product_slug
          FROM orders o
          JOIN customers c ON c.id = o.customer_id
          JOIN order_items oi ON oi.order_id = o.id
          LEFT JOIN products p ON p.id = oi.product_id
-         LEFT JOIN supplier_products sp ON sp.product_id = oi.product_id AND sp.is_primary = true
         WHERE o.id = $1`,
       [orderId]
     );
@@ -80,8 +78,11 @@ async function notifyOrderStatusToUtmify(pool, orderId, { status, approvedDate, 
     const totalPriceInCents = first.total_cents;
     // Estimativa: a Asaas cobra por fora, não temos a taxa exata aqui.
     const gatewayFeeInCents = Math.round(totalPriceInCents * 0.05);
-    const costCents = rows.reduce((sum, r) => sum + (r.cost_cents || 0) * r.quantity, 0);
-    const userCommissionInCents = totalPriceInCents - gatewayFeeInCents - costCents;
+    // NÃO subtrai custo de produto aqui — a Utmify já faz essa conta
+    // sozinha a partir do cadastro de custo dela própria (card "Custos
+    // de Produto" no painel). Se subtraíssemos aqui de novo, o custo
+    // sairia contado em dobro e o "Faturamento Líquido" ficaria errado.
+    const userCommissionInCents = totalPriceInCents - gatewayFeeInCents;
 
     const payload = {
       orderId: first.id,
