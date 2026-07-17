@@ -5,6 +5,7 @@ import { useSearchParams } from 'next/navigation';
 import Image from 'next/image';
 import Link from 'next/link';
 import { fetchProducts, type Product } from '@/lib/api';
+import PromoBanner from '@/components/PromoBanner';
 
 // Ordem fixa do grid: destaques primeiro, depois Alpha ativos, depois
 // C7Drop "Em breve" — aplicada tanto na home completa quanto nos
@@ -68,6 +69,17 @@ function HomeContent() {
 
   return (
     <main className="page">
+      <PromoBanner
+        imagem="/banners/kit-5-potes.png"
+        selo="FRETE GRÁTIS"
+        titulo="Kit de 5 Potes"
+        precoDe="R$ 149,90"
+        precoPor="R$ 104,90"
+        sufixoPreco="à vista"
+        textoBotao="COMPRAR"
+        link="/product/kit-5-potes-hermeticos"
+      />
+
       <section className="hero">
         <div className="hero__media">
           <Image
