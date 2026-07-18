@@ -5,16 +5,23 @@
  * Rotas:
  *   GET  /api/products                        → catálogo (produto + custo/margem do fornecedor primário)
  *   POST /api/checkout                        → valida e cria o pedido com snapshots (carrinho, sem gateway ainda)
- *   POST /checkout                            → checkout Pix real: pedido + cobrança Asaas + QR code
+ *   POST /checkout                            → checkout real (1+ itens): pedido + cobrança Asaas (Pix/cartão/boleto)
  *   GET  /api/orders/:id/status                → status do pedido; se pending, checa a Asaas direto (fallback pro webhook)
  *   GET  /api/orders/tracking/:orderId         → rastreio público (página /rastrear) — sem dados sensíveis
  *   POST /webhooks/asaas                      → notificação de pagamento; cria repasse (supplier_orders) ao confirmar pagamento
  *   GET  /admin/supplier-orders/pending        → (auth: x-admin-token) lista de compras pendentes com o fornecedor
  *   POST /admin/supplier-orders/:id/mark-placed → (auth: x-admin-token) marca repasse como feito manualmente
+ *   POST /api/auth/register                   → cria conta de cliente (nome, email, senha, aceite_privacidade)
+ *   POST /api/auth/login                      → login (email, senha) → cookie de sessão (JWT httpOnly)
+ *   GET  /api/auth/me                         → dados da conta logada (via cookie de sessão)
+ *   POST /api/auth/logout                     → limpa o cookie de sessão
  *   GET  /health                              → healthcheck
  */
 const { randomUUID, timingSafeEqual } = require('crypto');
 const express = require('express');
+const cookieParser = require('cookie-parser');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const { logger } = require('./src/shared/lib/logger');
 const { validateCheckout } = require('./src/modules/orders/service/validate-checkout');
@@ -32,6 +39,7 @@ const { notifyOrderStatusToUtmify } = require('./src/modules/tracking/service/no
 
 const app = express();
 app.use(express.json());
+app.use(cookieParser());
 
 // Render (como Heroku) fica atrás de um proxy reverso — sem isso, req.ip
 // devolve o IP interno do proxy, não o do cliente. O Asaas exige o IP
@@ -387,14 +395,16 @@ function getCurrentAsaasEnvironment() {
 const VALID_PAYMENT_METHODS = ['PIX', 'CREDIT_CARD', 'BOLETO'];
 
 /**
- * Checkout (fluxo real com Asaas) — um produto por pedido.
+ * Checkout (fluxo real com Asaas) — um pedido com 1 ou mais itens.
  * Body esperado (comum aos 3 métodos):
  * {
  *   "customerEmail": "cliente@email.com",
  *   "customerName": "Cliente Teste",
  *   "customerCpfCnpj": "12345678900",
- *   "productSlug": "escorredor-suspenso",
- *   "quantity": 1,
+ *   "items": [
+ *     { "productSlug": "escorredor-suspenso", "quantity": 1 },
+ *     { "productSlug": "kit-5-potes-hermeticos", "quantity": 2 }
+ *   ],
  *   "shippingStreet": "Rua das Flores",
  *   "shippingNumber": "123",
  *   "shippingComplement": "Apto 45",       // opcional
@@ -426,8 +436,7 @@ app.post('/checkout', async (req, res) => {
     customerEmail,
     customerName,
     customerCpfCnpj,
-    productSlug,
-    quantity,
+    items,
     shippingStreet,
     shippingNumber,
     shippingComplement,
@@ -465,8 +474,6 @@ app.post('/checkout', async (req, res) => {
   if (!customerEmail) missing.push('customerEmail');
   if (!customerName) missing.push('customerName');
   if (!customerCpfCnpj) missing.push('customerCpfCnpj');
-  if (!productSlug) missing.push('productSlug');
-  if (quantity === undefined || quantity === null) missing.push('quantity');
   if (!shippingStreet) missing.push('shippingStreet');
   if (!shippingNumber) missing.push('shippingNumber');
   if (!shippingNeighborhood) missing.push('shippingNeighborhood');
@@ -492,9 +499,18 @@ app.post('/checkout', async (req, res) => {
     });
   }
 
-  if (!Number.isInteger(quantity) || quantity <= 0) {
+  if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({
-      error: { code: 'BAD_REQUEST', message: 'quantity precisa ser um número inteiro maior que zero' },
+      error: { code: 'BAD_REQUEST', message: 'items precisa ser uma lista com pelo menos 1 produto' },
+    });
+  }
+
+  const invalidItem = items.find(
+    (item) => !item || typeof item.productSlug !== 'string' || !item.productSlug || !Number.isInteger(item.quantity) || item.quantity <= 0
+  );
+  if (invalidItem) {
+    return res.status(400).json({
+      error: { code: 'BAD_REQUEST', message: 'cada item precisa de productSlug (string) e quantity (inteiro maior que zero)' },
     });
   }
 
@@ -510,33 +526,59 @@ app.post('/checkout', async (req, res) => {
     });
   }
 
-  // 1) Produto: preço e limite de parcelas SEMPRE do banco, nunca de um
-  // valor vindo do cliente.
-  let product;
+  // 1) Produtos: preço, disponibilidade e limite de parcelas SEMPRE do
+  // banco, nunca de um valor vindo do cliente. Junta com
+  // supplier_products pra também travar available = true aqui — a
+  // rota antiga só checava active, e um item "Em breve" nunca deveria
+  // completar checkout mesmo se alguém montar a chamada na mão.
+  let cartProducts;
   try {
+    const slugs = items.map((item) => item.productSlug);
     const { rows } = await pool.query(
-      `SELECT id, name, sale_price_cents, max_installments FROM products WHERE slug = $1 AND active = true LIMIT 1`,
-      [productSlug]
+      `SELECT p.id, p.name, p.slug, p.sale_price_cents, p.max_installments, sp.available
+         FROM products p
+         JOIN supplier_products sp ON sp.product_id = p.id AND sp.is_primary = true
+        WHERE p.slug = ANY($1::text[]) AND p.active = true`,
+      [slugs]
     );
-    if (rows.length === 0) {
-      return res.status(404).json({ error: { code: 'PRODUCT_NOT_FOUND' } });
+
+    const bySlug = new Map(rows.map((row) => [row.slug, row]));
+
+    const notFound = slugs.filter((slug) => !bySlug.has(slug));
+    if (notFound.length > 0) {
+      return res.status(404).json({
+        error: { code: 'PRODUCT_NOT_FOUND', message: `Produto(s) não encontrado(s): ${notFound.join(', ')}` },
+      });
     }
-    product = rows[0];
+
+    const unavailable = slugs.filter((slug) => !bySlug.get(slug).available);
+    if (unavailable.length > 0) {
+      return res.status(409).json({
+        error: { code: 'PRODUCT_UNAVAILABLE', message: `Produto(s) indisponível(is): ${unavailable.join(', ')}` },
+      });
+    }
+
+    cartProducts = items.map((item) => ({ ...bySlug.get(item.productSlug), quantity: item.quantity }));
   } catch (err) {
-    req.log.error({ err }, 'Erro ao buscar produto no checkout');
+    req.log.error({ err }, 'Erro ao buscar produtos no checkout');
     return res.status(500).json({ error: { code: 'INTERNAL' } });
   }
 
-  if (paymentMethod === 'CREDIT_CARD' && installments > product.max_installments) {
+  // Carrinho com produtos de max_installments diferentes: o limite que
+  // vale é o mais restritivo (nunca parcela mais do que QUALQUER item
+  // do carrinho permite).
+  const effectiveMaxInstallments = Math.min(...cartProducts.map((p) => p.max_installments));
+
+  if (paymentMethod === 'CREDIT_CARD' && installments > effectiveMaxInstallments) {
     return res.status(400).json({
       error: {
         code: 'TOO_MANY_INSTALLMENTS',
-        message: `Este produto aceita no máximo ${product.max_installments}x`,
+        message: `O parcelamento máximo pra este carrinho é ${effectiveMaxInstallments}x (limitado pelo produto com menor limite)`,
       },
     });
   }
 
-  const totalCents = product.sale_price_cents * quantity;
+  const totalCents = cartProducts.reduce((sum, p) => sum + p.sale_price_cents * p.quantity, 0);
 
   // A Asaas rejeita qualquer cobrança abaixo de R$ 5,00 (confirmado em
   // produção: "o valor da cobrança menos o desconto não pode ser menor
@@ -609,11 +651,13 @@ app.post('/checkout', async (req, res) => {
     );
     order = orderRow;
 
-    await client.query(
-      `INSERT INTO order_items (order_id, product_id, product_name, unit_price_cents, quantity)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [order.id, product.id, product.name, product.sale_price_cents, quantity]
-    );
+    for (const p of cartProducts) {
+      await client.query(
+        `INSERT INTO order_items (order_id, product_id, product_name, unit_price_cents, quantity)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [order.id, p.id, p.name, p.sale_price_cents, p.quantity]
+      );
+    }
 
     await client.query('COMMIT');
   } catch (err) {
@@ -972,6 +1016,174 @@ app.post('/webhooks/asaas', async (req, res) => {
     req.log.error({ err, paymentId: payment.id }, 'Erro ao processar webhook do Asaas');
     res.status(500).json({ error: { code: 'INTERNAL' } });
   }
+});
+
+/**
+ * ==================================================================
+ * ROTAS /api/auth/* — conta de cliente (comprador), login com senha.
+ * ==================================================================
+ * Sessão via JWT em cookie httpOnly (não acessível por JS no browser,
+ * mitiga roubo de token por XSS). `secure` só em produção porque em
+ * dev local (http://localhost) o browser descarta cookie secure.
+ *
+ * Tabela: customer_accounts (migration 014) — DIFERENTE de `customers`
+ * (usada no checkout, sem senha). Ver comentário na migration.
+ */
+const SESSION_COOKIE_NAME = 'cabetudo_session';
+const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 dias
+
+function signCustomerSession(customerAccountId) {
+  return jwt.sign({ sub: customerAccountId }, process.env.JWT_SECRET, { expiresIn: '30d' });
+}
+
+function sessionCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: SESSION_MAX_AGE_MS,
+    path: '/',
+  };
+}
+
+function toPublicCustomerAccount(row) {
+  return { id: row.id, name: row.name, email: row.email, createdAt: row.created_at };
+}
+
+const EMAIL_FORMAT = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+app.post('/api/auth/register', async (req, res) => {
+  const { nome, email, senha, aceite_privacidade } = req.body || {};
+
+  const missing = [];
+  if (!nome) missing.push('nome');
+  if (!email) missing.push('email');
+  if (!senha) missing.push('senha');
+  if (missing.length > 0) {
+    return res.status(400).json({
+      error: { code: 'BAD_REQUEST', message: `Campos obrigatórios faltando: ${missing.join(', ')}` },
+    });
+  }
+
+  if (!EMAIL_FORMAT.test(email)) {
+    return res.status(400).json({ error: { code: 'INVALID_EMAIL', message: 'Email inválido' } });
+  }
+
+  if (senha.length < 6) {
+    return res.status(400).json({
+      error: { code: 'WEAK_PASSWORD', message: 'A senha precisa ter pelo menos 6 caracteres' },
+    });
+  }
+
+  // Aceite obrigatório: precisa vir explicitamente `true`, não só "truthy"
+  // (uma string "false" também é truthy em JS, então o check é estrito).
+  if (aceite_privacidade !== true) {
+    return res.status(400).json({
+      error: { code: 'PRIVACY_NOT_ACCEPTED', message: 'É necessário aceitar a Política de Privacidade' },
+    });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(senha, 10);
+
+    const { rows } = await pool.query(
+      `INSERT INTO customer_accounts (name, email, password_hash, privacy_accepted_at)
+       VALUES ($1, $2, $3, now())
+       RETURNING id, name, email, created_at`,
+      [nome, email, passwordHash]
+    );
+
+    const account = rows[0];
+    const token = signCustomerSession(account.id);
+    res.cookie(SESSION_COOKIE_NAME, token, sessionCookieOptions());
+
+    req.log.info({ event: 'CUSTOMER_ACCOUNT_CREATED', customerAccountId: account.id }, 'Conta de cliente criada');
+    res.status(201).json({ customer: toPublicCustomerAccount(account) });
+  } catch (err) {
+    if (err.code === '23505') {
+      // unique_violation em customer_accounts.email
+      return res.status(409).json({ error: { code: 'EMAIL_ALREADY_REGISTERED', message: 'Já existe uma conta com este email' } });
+    }
+    req.log.error({ err }, 'Erro ao criar conta de cliente');
+    res.status(500).json({ error: { code: 'INTERNAL' } });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, senha } = req.body || {};
+
+  if (!email || !senha) {
+    return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'email e senha são obrigatórios' } });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, email, password_hash, created_at FROM customer_accounts WHERE email = $1`,
+      [email]
+    );
+
+    // Mensagem genérica em ambos os casos (email não existe / senha errada)
+    // — não dá pra um atacante descobrir se um email tem conta ou não.
+    if (rows.length === 0) {
+      return res.status(401).json({ error: { code: 'INVALID_CREDENTIALS', message: 'Email ou senha inválidos' } });
+    }
+
+    const account = rows[0];
+    const passwordMatches = await bcrypt.compare(senha, account.password_hash);
+    if (!passwordMatches) {
+      return res.status(401).json({ error: { code: 'INVALID_CREDENTIALS', message: 'Email ou senha inválidos' } });
+    }
+
+    const token = signCustomerSession(account.id);
+    res.cookie(SESSION_COOKIE_NAME, token, sessionCookieOptions());
+
+    req.log.info({ event: 'CUSTOMER_LOGIN', customerAccountId: account.id }, 'Login de cliente');
+    res.json({ customer: toPublicCustomerAccount(account) });
+  } catch (err) {
+    req.log.error({ err }, 'Erro ao autenticar cliente');
+    res.status(500).json({ error: { code: 'INTERNAL' } });
+  }
+});
+
+app.get('/api/auth/me', async (req, res) => {
+  const token = req.cookies?.[SESSION_COOKIE_NAME];
+  if (!token) {
+    return res.status(401).json({ error: { code: 'UNAUTHENTICATED' } });
+  }
+
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    return res.status(401).json({ error: { code: 'UNAUTHENTICATED' } });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, email, created_at FROM customer_accounts WHERE id = $1`,
+      [payload.sub]
+    );
+
+    if (rows.length === 0) {
+      // Conta pode ter sido apagada depois do token emitido — trata como deslogado.
+      return res.status(401).json({ error: { code: 'UNAUTHENTICATED' } });
+    }
+
+    res.json({ customer: toPublicCustomerAccount(rows[0]) });
+  } catch (err) {
+    req.log.error({ err }, 'Erro ao buscar conta logada');
+    res.status(500).json({ error: { code: 'INTERNAL' } });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  // clearCookie NÃO deve receber maxAge: se receber, o cookie module usa
+  // esse maxAge pra computar Expires (sobrescrevendo o "expira no passado"
+  // que clearCookie tentaria aplicar) — o cookie ficaria com valor vazio
+  // mas Expires ainda 30 dias no futuro.
+  const { maxAge, ...clearOptions } = sessionCookieOptions();
+  res.clearCookie(SESSION_COOKIE_NAME, clearOptions);
+  res.json({ ok: true });
 });
 
 /**

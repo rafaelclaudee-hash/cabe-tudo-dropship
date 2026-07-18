@@ -5,7 +5,56 @@ import { useSearchParams } from 'next/navigation';
 import Image from 'next/image';
 import Link from 'next/link';
 import { fetchProducts, type Product } from '@/lib/api';
-import PromoBanner from '@/components/PromoBanner';
+import Carousel from '@/components/Carousel';
+
+interface BannerSlide {
+  imagem: string;
+  // Dimensões REAIS do arquivo — vira aspect-ratio inline no slide
+  // (.carousel-banner-slide), que soma com o max-height do CSS pra
+  // dar a proporção certa até um teto de altura, sem esticar/cortar
+  // em telas largas (ver globals.css e Carousel.tsx).
+  imagemLargura: number;
+  imagemAltura: number;
+  link: string;
+  titulo: string;
+  // Não viram texto — a imagem já traz o design pronto (selo, título,
+  // preço, botão). Servem só pra compor o alt (acessibilidade/SEO).
+  selo?: string;
+  precoDe?: string;
+  precoPor?: string;
+  sufixoPreco?: string;
+  textoBotao?: string;
+}
+
+function composeAlt(slide: BannerSlide) {
+  const parts = [slide.titulo];
+  if (slide.selo) parts.push(slide.selo);
+  if (slide.precoDe && slide.precoPor) {
+    parts.push(`de ${slide.precoDe} por ${slide.precoPor}${slide.sufixoPreco ? ` ${slide.sufixoPreco}` : ''}`);
+  } else if (slide.precoPor) {
+    parts.push(`${slide.precoPor}${slide.sufixoPreco ? ` ${slide.sufixoPreco}` : ''}`);
+  }
+  if (slide.textoBotao) parts.push(slide.textoBotao);
+  return parts.join(' — ');
+}
+
+// Banners de imagem do carrossel do topo — cada imagem já traz o
+// design pronto. Adicionar mais é só empilhar mais objetos aqui; o
+// slide do hero (foto + texto) sempre entra por último, depois deles.
+const HOME_BANNERS: BannerSlide[] = [
+  {
+    imagem: '/banners/kit-5-potes.png',
+    imagemLargura: 3192,
+    imagemAltura: 1312,
+    link: '/product/kit-5-potes-hermeticos',
+    titulo: 'Kit de 5 Potes',
+    selo: 'FRETE GRÁTIS',
+    precoDe: 'R$ 149,90',
+    precoPor: 'R$ 104,90',
+    sufixoPreco: 'à vista',
+    textoBotao: 'COMPRAR',
+  },
+];
 
 // Ordem fixa do grid: destaques primeiro, depois Alpha ativos, depois
 // C7Drop "Em breve" — aplicada tanto na home completa quanto nos
@@ -67,47 +116,56 @@ function HomeContent() {
     ? sortedProducts.filter((product) => product.category === categoria)
     : sortedProducts;
 
+  const carouselSlides = [
+    ...HOME_BANNERS.map((banner, i) => (
+      <Link
+        key={banner.imagem}
+        href={banner.link}
+        className="carousel-banner-slide"
+        style={{ aspectRatio: `${banner.imagemLargura} / ${banner.imagemAltura}` }}
+      >
+        <Image
+          src={banner.imagem}
+          alt={composeAlt(banner)}
+          fill
+          priority={i === 0}
+          sizes="100vw"
+          className="carousel-banner-slide__image"
+        />
+      </Link>
+    )),
+    <section className="hero" key="hero">
+      <div className="hero__media">
+        <Image
+          src="/hero.png"
+          alt="Família organizando a cozinha com produtos Cabe Tudo"
+          fill
+          quality={85}
+          sizes="(max-width: 700px) 100vw, 60vw"
+          className="hero__image"
+        />
+      </div>
+      <div className="hero__content">
+        <span className="hero__kicker">Para cada canto da casa</span>
+        <h1 className="hero__title">
+          Cabe tudo.
+          <br />
+          Sobra espaço.
+        </h1>
+        <p className="hero__subtitle">
+          Utilidades e organizadores que aproveitam cada canto da sua casa.
+        </p>
+        <div className="hero__cta-group">
+          <a href="#produtos" className="hero__cta">Ver produtos</a>
+          <a href="#" className="hero__cta-secondary">Como funciona →</a>
+        </div>
+      </div>
+    </section>,
+  ];
+
   return (
     <main className="page">
-      <PromoBanner
-        imagem="/banners/kit-5-potes.png"
-        selo="FRETE GRÁTIS"
-        titulo="Kit de 5 Potes"
-        precoDe="R$ 149,90"
-        precoPor="R$ 104,90"
-        sufixoPreco="à vista"
-        textoBotao="COMPRAR"
-        link="/product/kit-5-potes-hermeticos"
-      />
-
-      <section className="hero">
-        <div className="hero__media">
-          <Image
-            src="/hero.png"
-            alt="Família organizando a cozinha com produtos Cabe Tudo"
-            fill
-            priority
-            quality={85}
-            sizes="(max-width: 700px) 100vw, 60vw"
-            className="hero__image"
-          />
-        </div>
-        <div className="hero__content">
-          <span className="hero__kicker">Para cada canto da casa</span>
-          <h1 className="hero__title">
-            Cabe tudo.
-            <br />
-            Sobra espaço.
-          </h1>
-          <p className="hero__subtitle">
-            Utilidades e organizadores que aproveitam cada canto da sua casa.
-          </p>
-          <div className="hero__cta-group">
-            <a href="#produtos" className="hero__cta">Ver produtos</a>
-            <a href="#" className="hero__cta-secondary">Como funciona →</a>
-          </div>
-        </div>
-      </section>
+      <Carousel slides={carouselSlides} />
 
       <section>
         <h2>Cabe Tudo</h2>

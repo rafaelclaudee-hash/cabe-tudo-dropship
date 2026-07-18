@@ -11,6 +11,7 @@ import {
   type CheckoutResult,
 } from '@/lib/api';
 import { readUtmCookie } from '@/lib/utm';
+import { useCart } from '@/lib/cart-context';
 
 function formatCentsToBRL(cents: number) {
   return `R$ ${(cents / 100).toFixed(2).replace('.', ',')}`;
@@ -47,6 +48,7 @@ const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
 
 function friendlyErrorMessage(message: string) {
   if (message === 'PRODUCT_NOT_FOUND') return 'Produto não encontrado.';
+  if (message === 'PRODUCT_UNAVAILABLE') return 'Um ou mais produtos do carrinho não estão mais disponíveis.';
   if (message === 'PAYMENT_GATEWAY_ERROR') {
     return 'Não foi possível gerar a cobrança agora. Seu pedido já foi registrado — tente novamente.';
   }
@@ -56,18 +58,32 @@ function friendlyErrorMessage(message: string) {
   return message;
 }
 
+interface CheckoutLineItem {
+  slug: string;
+  quantity: number;
+  product: Product;
+}
+
 function CheckoutContent() {
   const searchParams = useSearchParams();
-  const productSlug = searchParams.get('product');
+  const directProductSlug = searchParams.get('product');
+  const isDirectMode = Boolean(directProductSlug);
 
-  const [product, setProduct] = useState<Product | null>(null);
-  const [productLoading, setProductLoading] = useState(true);
-  const [productError, setProductError] = useState<string | null>(null);
+  const { items: cartItems } = useCart();
+
+  // Modo compra direta: 1 produto, quantidade editável nesta página
+  // (comportamento de sempre). Modo carrinho: quantidades já vêm
+  // fixadas do carrinho (ajustadas no drawer, não aqui).
+  const [directQuantity, setDirectQuantity] = useState(1);
+
+  const [lineItems, setLineItems] = useState<CheckoutLineItem[]>([]);
+  const [itemsLoading, setItemsLoading] = useState(true);
+  const [itemsError, setItemsError] = useState<string | null>(null);
+  const [unavailableSlugs, setUnavailableSlugs] = useState<string[]>([]);
 
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
   const [customerCpfCnpj, setCustomerCpfCnpj] = useState('');
-  const [quantity, setQuantity] = useState(1);
 
   const [shippingZipCode, setShippingZipCode] = useState('');
   const [shippingStreet, setShippingStreet] = useState('');
@@ -91,41 +107,90 @@ function CheckoutContent() {
   const [result, setResult] = useState<CheckoutResult | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // Busca os produtos (1 direto, ou todos do carrinho) e monta a lista
+  // unificada que o resto da página usa, independente do modo.
   useEffect(() => {
-    if (!productSlug) {
-      setProductLoading(false);
-      return;
-    }
-
     let cancelled = false;
-    async function loadProduct() {
+
+    async function loadDirect(slug: string) {
       try {
-        const data = await fetchProductBySlug(productSlug as string);
+        const product = await fetchProductBySlug(slug);
         if (cancelled) return;
-        if (!data) {
-          setProductError('Produto não encontrado.');
+        if (!product) {
+          setItemsError('Produto não encontrado.');
         } else {
-          setProduct(data);
+          setLineItems([{ slug, quantity: directQuantity, product }]);
         }
       } catch (err) {
-        if (!cancelled) setProductError('Erro ao carregar produto. Tente novamente.');
+        if (!cancelled) setItemsError('Erro ao carregar produto. Tente novamente.');
         console.error(err);
       } finally {
-        if (!cancelled) setProductLoading(false);
+        if (!cancelled) setItemsLoading(false);
       }
     }
 
-    loadProduct();
+    async function loadCart() {
+      if (cartItems.length === 0) {
+        if (!cancelled) setItemsLoading(false);
+        return;
+      }
+      try {
+        const results = await Promise.all(
+          cartItems.map(async (item) => ({ item, product: await fetchProductBySlug(item.slug) }))
+        );
+        if (cancelled) return;
+
+        const missing = results.filter((r) => !r.product);
+        // Item cadastrado no carrinho (localStorage) mas que sumiu do
+        // catálogo (descontinuado/ocultado) desde que foi adicionado —
+        // não trava o checkout, só ignora esse item e avisa.
+        if (missing.length > 0) {
+          setUnavailableSlugs(missing.map((r) => r.item.slug));
+        }
+
+        const valid = results
+          .filter((r): r is { item: { slug: string; quantity: number }; product: Product } => Boolean(r.product))
+          .map((r) => ({ slug: r.item.slug, quantity: r.item.quantity, product: r.product }));
+
+        setLineItems(valid);
+      } catch (err) {
+        setItemsError('Erro ao carregar carrinho. Tente novamente.');
+        console.error(err);
+      } finally {
+        if (!cancelled) setItemsLoading(false);
+      }
+    }
+
+    setItemsLoading(true);
+    setItemsError(null);
+    setUnavailableSlugs([]);
+
+    if (directProductSlug) {
+      loadDirect(directProductSlug);
+    } else {
+      loadCart();
+    }
+
     return () => {
       cancelled = true;
     };
-  }, [productSlug]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [directProductSlug, isDirectMode ? directQuantity : cartItems]);
 
-  // Evita levar um número de parcelas de um produto pro outro (ou de
-  // quando o método era cartão pra quando volta a ser) além do limite.
+  // Evita levar um número de parcelas de quando o carrinho/produto era
+  // outro (ou de quando o método era cartão pra quando volta a ser)
+  // além do limite efetivo atual.
   useEffect(() => {
     setInstallments(1);
-  }, [product?.slug, paymentMethod]);
+  }, [lineItems.length, paymentMethod]);
+
+  const totalCents = lineItems.reduce((sum, li) => sum + li.product.sale_price_cents * li.quantity, 0);
+
+  // Carrinho com produtos de max_installments diferentes: o limite que
+  // vale pro cliente ver (e o backend confirma de novo) é o mais
+  // restritivo.
+  const effectiveMaxInstallments =
+    lineItems.length > 0 ? Math.min(...lineItems.map((li) => li.product.max_installments)) : 1;
 
   const isCardStepValid =
     paymentMethod !== 'CREDIT_CARD' ||
@@ -136,14 +201,13 @@ function CheckoutContent() {
       cardHolderName.trim().length > 0 &&
       isValidPhoneFormat(cardHolderPhone) &&
       installments >= 1 &&
-      installments <= (product?.max_installments || 1));
+      installments <= effectiveMaxInstallments);
 
   const isFormValid =
+    lineItems.length > 0 &&
     customerName.trim().length > 0 &&
     /\S+@\S+\.\S+/.test(customerEmail) &&
     isValidCpfCnpjFormat(customerCpfCnpj) &&
-    Number.isInteger(quantity) &&
-    quantity >= 1 &&
     isValidZipCodeFormat(shippingZipCode) &&
     shippingStreet.trim().length > 0 &&
     shippingNumber.trim().length > 0 &&
@@ -154,7 +218,7 @@ function CheckoutContent() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!isFormValid || !productSlug) return;
+    if (!isFormValid) return;
 
     setSubmitting(true);
     setSubmitError(null);
@@ -166,8 +230,7 @@ function CheckoutContent() {
         customerEmail,
         customerName,
         customerCpfCnpj: customerCpfCnpj.replace(/\D/g, ''),
-        productSlug,
-        quantity,
+        items: lineItems.map((li) => ({ productSlug: li.slug, quantity: li.quantity })),
         shippingZipCode,
         shippingStreet,
         shippingNumber,
@@ -217,30 +280,30 @@ function CheckoutContent() {
     }
   }
 
-  if (!productSlug) {
+  if (!isDirectMode && cartItems.length === 0 && !itemsLoading) {
     return (
       <main className="page">
         <h1>Checkout</h1>
         <div className="card" style={{ cursor: 'default' }}>
-          <p>Nenhum produto selecionado.</p>
+          <p>Seu carrinho está vazio.</p>
         </div>
         <Link href="/" className="btn-back">← Voltar para a loja</Link>
       </main>
     );
   }
 
-  if (productLoading) {
+  if (itemsLoading) {
     return (
       <main className="page">
-        <p>Carregando produto...</p>
+        <p>Carregando {isDirectMode ? 'produto' : 'carrinho'}...</p>
       </main>
     );
   }
 
-  if (productError || !product) {
+  if (itemsError || lineItems.length === 0) {
     return (
       <main className="page">
-        <p className="error-text">{productError || 'Produto não encontrado.'}</p>
+        <p className="error-text">{itemsError || 'Nenhum produto disponível pra checkout.'}</p>
         <Link href="/" className="btn-back">← Voltar para a loja</Link>
       </main>
     );
@@ -312,18 +375,35 @@ function CheckoutContent() {
     );
   }
 
-  const totalCents = product.sale_price_cents * quantity;
-
   return (
     <main className="page">
-      <Link href={`/product/${product.slug}`} className="btn-back">← Voltar para o produto</Link>
+      <Link href={isDirectMode ? `/product/${directProductSlug}` : '/'} className="btn-back">
+        ← {isDirectMode ? 'Voltar para o produto' : 'Voltar para a loja'}
+      </Link>
       <h1>Checkout</h1>
 
-      <div className="card" style={{ cursor: 'default' }}>
-        <h3>{product.name}</h3>
-        <span className="price">{formatCentsToBRL(product.sale_price_cents)}</span>
-        {quantity > 1 && <small>Total ({quantity}x): {formatCentsToBRL(totalCents)}</small>}
-      </div>
+      {unavailableSlugs.length > 0 && (
+        <p className="error-text">
+          {unavailableSlugs.length} item(ns) do carrinho não está(ão) mais disponível(is) e foi(ram) ignorado(s) neste
+          pedido.
+        </p>
+      )}
+
+      <ul className="checkout-summary">
+        {lineItems.map((li) => (
+          <li key={li.slug} className="checkout-summary__item">
+            <span className="checkout-summary__name">
+              {li.product.name}
+              {li.quantity > 1 ? ` × ${li.quantity}` : ''}
+            </span>
+            <span className="price">{formatCentsToBRL(li.product.sale_price_cents * li.quantity)}</span>
+          </li>
+        ))}
+        <li className="checkout-summary__total">
+          <span>Total</span>
+          <span className="price">{formatCentsToBRL(totalCents)}</span>
+        </li>
+      </ul>
 
       <form onSubmit={handleSubmit} className="form">
         <label>
@@ -360,16 +440,18 @@ function CheckoutContent() {
           />
         </label>
 
-        <label>
-          Quantidade
-          <input
-            type="number"
-            min={1}
-            value={quantity}
-            onChange={(e) => setQuantity(Math.max(1, Number(e.target.value) || 1))}
-            disabled={submitting}
-          />
-        </label>
+        {isDirectMode && (
+          <label>
+            Quantidade
+            <input
+              type="number"
+              min={1}
+              value={directQuantity}
+              onChange={(e) => setDirectQuantity(Math.max(1, Number(e.target.value) || 1))}
+              disabled={submitting}
+            />
+          </label>
+        )}
 
         <h3>Endereço de entrega</h3>
 
@@ -560,7 +642,7 @@ function CheckoutContent() {
                 onChange={(e) => setInstallments(Number(e.target.value))}
                 disabled={submitting}
               >
-                {Array.from({ length: product.max_installments }, (_, i) => i + 1).map((n) => (
+                {Array.from({ length: effectiveMaxInstallments }, (_, i) => i + 1).map((n) => (
                   <option key={n} value={n}>
                     {n}x de {formatCentsToBRL(totalCents / n)}{n > 1 ? ' sem juros' : ''}
                   </option>

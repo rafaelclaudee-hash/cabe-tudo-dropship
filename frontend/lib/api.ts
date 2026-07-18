@@ -30,12 +30,11 @@ export interface Product {
 }
 
 export interface Order {
-  order_id: string;
+  id: string;
   status: string;
   total_cents: number;
   created_at: string;
   items: Array<{
-    product_id: string;
     product_name: string;
     unit_price_cents: number;
     quantity: number;
@@ -113,12 +112,16 @@ export async function createOrder(customerEmail: string, items: any[]) {
 
 export type PaymentMethod = 'PIX' | 'CREDIT_CARD' | 'BOLETO';
 
+export interface CheckoutItem {
+  productSlug: string;
+  quantity: number;
+}
+
 export interface CheckoutParams {
   customerEmail: string;
   customerName: string;
   customerCpfCnpj: string;
-  productSlug: string;
-  quantity: number;
+  items: CheckoutItem[];
   shippingStreet: string;
   shippingNumber: string;
   shippingComplement?: string;
@@ -197,4 +200,84 @@ export async function createCheckout(params: CheckoutParams): Promise<CheckoutRe
   }
 
   return response.json();
+}
+
+/**
+ * Conta de cliente (login) — Fase 2. Sessão via cookie httpOnly, os
+ * proxies /api/auth/* cuidam de repassar o cookie nos dois sentidos.
+ */
+export interface CustomerAccount {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+}
+
+export interface RegisterParams {
+  nome: string;
+  email: string;
+  senha: string;
+  aceite_privacidade: boolean;
+}
+
+export interface LoginParams {
+  email: string;
+  senha: string;
+}
+
+async function extractAuthErrorMessage(response: Response): Promise<string> {
+  const data = await response.json().catch(() => null);
+  return data?.error?.message || data?.error?.code || `Erro (${response.status})`;
+}
+
+export async function registerCustomer(params: RegisterParams): Promise<CustomerAccount> {
+  const response = await fetch('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+
+  if (!response.ok) {
+    throw new Error(await extractAuthErrorMessage(response));
+  }
+
+  const data = await response.json();
+  return data.customer;
+}
+
+export async function loginCustomer(params: LoginParams): Promise<CustomerAccount> {
+  const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+
+  if (!response.ok) {
+    throw new Error(await extractAuthErrorMessage(response));
+  }
+
+  const data = await response.json();
+  return data.customer;
+}
+
+/**
+ * Devolve a conta logada, ou null se não houver sessão válida (401 é
+ * esperado aqui — não é um estado de erro, é "deslogado").
+ */
+export async function fetchCurrentCustomer(): Promise<CustomerAccount | null> {
+  const response = await fetch('/api/auth/me', { cache: 'no-store' });
+
+  if (response.status === 401) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`Erro ao buscar conta logada: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.customer;
+}
+
+export async function logoutCustomer(): Promise<void> {
+  await fetch('/api/auth/logout', { method: 'POST' });
 }

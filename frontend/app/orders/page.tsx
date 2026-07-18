@@ -50,9 +50,9 @@ export default function OrdersPage() {
       {orders.length > 0 && (
         <ul className="orders-list">
           {orders.map((order) => (
-            <li key={order.order_id} className="order-card">
+            <li key={order.id} className="order-card">
               <div className="order-card__header">
-                <span>Pedido {order.order_id}</span>
+                <span>Pedido {order.id}</span>
                 <span className="badge">{order.status}</span>
               </div>
               <small className="order-card__meta">
@@ -60,8 +60,8 @@ export default function OrdersPage() {
                 {new Date(order.created_at).toLocaleDateString('pt-BR')}
               </small>
               <ul className="order-items">
-                {order.items.map((item) => (
-                  <li key={item.product_id}>
+                {order.items.map((item, index) => (
+                  <li key={`${order.id}-${item.product_name}-${index}`}>
                     {item.product_name} x{item.quantity} - R${' '}
                     {(item.unit_price_cents / 100).toFixed(2).replace('.', ',')}
                   </li>

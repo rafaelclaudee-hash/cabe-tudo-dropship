@@ -4,12 +4,15 @@ import { useEffect, useState } from 'react';
 import Image from 'next/image';
 import Link from 'next/link';
 import { fetchProductBySlug, type Product } from '@/lib/api';
+import { useCart } from '@/lib/cart-context';
 
 export default function ProductPage({ params }: { params: { slug: string } }) {
   const [product, setProduct] = useState<Product | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activePhoto, setActivePhoto] = useState(0);
+  const [added, setAdded] = useState(false);
+  const { addItem } = useCart();
 
   useEffect(() => {
     async function loadProduct() {
@@ -51,6 +54,13 @@ export default function ProductPage({ params }: { params: { slug: string } }) {
 
   const photos = product.photos && product.photos.length > 0 ? product.photos : [];
   const whatsappMessage = encodeURIComponent(`Olá! Tenho interesse no produto: ${product.name}`);
+
+  function handleAddToCart() {
+    if (!product) return;
+    addItem(product.slug);
+    setAdded(true);
+    setTimeout(() => setAdded(false), 2000);
+  }
 
   return (
     <main className="page">
@@ -104,7 +114,12 @@ export default function ProductPage({ params }: { params: { slug: string } }) {
       )}
       <div className="product-cta-group">
         {product.available ? (
-          <Link href={`/checkout?product=${product.slug}`} className="btn">Ir para checkout</Link>
+          <>
+            <Link href={`/checkout?product=${product.slug}`} className="btn">Ir para checkout</Link>
+            <button type="button" className="btn btn--secondary" onClick={handleAddToCart}>
+              {added ? 'Adicionado!' : 'Adicionar ao carrinho'}
+            </button>
+          </>
         ) : (
           <button type="button" className="btn btn--disabled" disabled>
             Em breve
