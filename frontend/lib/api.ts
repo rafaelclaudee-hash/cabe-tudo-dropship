@@ -281,3 +281,26 @@ export async function fetchCurrentCustomer(): Promise<CustomerAccount | null> {
 export async function logoutCustomer(): Promise<void> {
   await fetch('/api/auth/logout', { method: 'POST' });
 }
+
+/**
+ * Newsletter — só captura e-mail (sem disparo de campanha). Idempotente
+ * no backend: inscrever o mesmo e-mail de novo nunca lança erro.
+ */
+export interface NewsletterSubscribeParams {
+  email: string;
+  aceite_lgpd: boolean;
+  origem: string;
+}
+
+export async function subscribeNewsletter(params: NewsletterSubscribeParams): Promise<void> {
+  const response = await fetch('/api/newsletter/subscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new Error(data?.error?.message || data?.error?.code || `Erro (${response.status})`);
+  }
+}

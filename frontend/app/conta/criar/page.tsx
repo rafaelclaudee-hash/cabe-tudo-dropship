@@ -3,7 +3,7 @@
 import { useState, type FormEvent } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { registerCustomer } from '@/lib/api';
+import { registerCustomer, subscribeNewsletter } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
 
 export default function CreateAccountPage() {
@@ -14,6 +14,7 @@ export default function CreateAccountPage() {
   const [email, setEmail] = useState('');
   const [senha, setSenha] = useState('');
   const [aceitePrivacidade, setAceitePrivacidade] = useState(false);
+  const [querNewsletter, setQuerNewsletter] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,6 +26,15 @@ export default function CreateAccountPage() {
 
     try {
       await registerCustomer({ nome, email, senha, aceite_privacidade: aceitePrivacidade });
+
+      // Chamada separada, depois do registro já ter dado certo — se essa
+      // falhar, não deve impedir a conta de ter sido criada com sucesso.
+      if (querNewsletter) {
+        subscribeNewsletter({ email, aceite_lgpd: true, origem: 'cadastro_conta' }).catch((err) => {
+          console.error('Falha ao inscrever na newsletter durante cadastro:', err);
+        });
+      }
+
       await refresh();
       router.push('/conta');
     } catch (err) {
@@ -88,6 +98,16 @@ export default function CreateAccountPage() {
               Política de Privacidade
             </Link>
           </span>
+        </label>
+
+        <label className="form-checkbox">
+          <input
+            type="checkbox"
+            checked={querNewsletter}
+            onChange={(e) => setQuerNewsletter(e.target.checked)}
+            disabled={submitting}
+          />
+          <span>Quero receber novidades por e-mail</span>
         </label>
 
         {error && <p className="error-text">{error}</p>}

@@ -7,6 +7,7 @@ import UtmCapture from '@/components/UtmCapture';
 import CartIcon from '@/components/CartIcon';
 import CartDrawer from '@/components/CartDrawer';
 import AccountLink from '@/components/AccountLink';
+import NewsletterForm from '@/components/NewsletterForm';
 import { CartProvider } from '@/lib/cart-context';
 import { AuthProvider } from '@/lib/auth-context';
 
@@ -63,6 +64,18 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           {children}
 
           <footer className="site-footer">
+            <div className="site-footer__newsletter">
+              <div className="site-footer__newsletter-inner">
+                <div className="site-footer__newsletter-copy">
+                  <h4>Novidades por e-mail</h4>
+                  <p className="site-footer__tagline">
+                    Promoções e lançamentos, direto na sua caixa de entrada.
+                  </p>
+                </div>
+                <NewsletterForm />
+              </div>
+            </div>
+
             <div className="site-footer__inner">
               <div>
                 <div className="site-footer__brand">Cabe Tudo</div>

@@ -1206,6 +1206,52 @@ button:disabled {
   font-size: 0.9rem;
 }
 
+/* Captura de newsletter — barra no topo do rodapé, acima das 4
+   colunas de links. Reusa .copy-field pra linha input+botão (mesmo
+   layout do campo de copiar código Pix) e .form-checkbox pro aceite;
+   só precisam de override de cor porque o rodapé é fundo escuro e
+   essas duas classes foram pensadas pra fundo claro. */
+.site-footer__newsletter {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.site-footer__newsletter-inner {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 28px 24px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+}
+
+.site-footer__newsletter-copy {
+  max-width: 320px;
+}
+
+.newsletter-form {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  max-width: 360px;
+}
+
+.newsletter-form .form-checkbox {
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 0.82rem;
+}
+
+.newsletter-form .error-text {
+  color: #ff9a90;
+}
+
+.newsletter-form__success {
+  color: white;
+  font-weight: 600;
+  max-width: 360px;
+}
+
 .site-footer__bottom {
   border-top: 1px solid rgba(255, 255, 255, 0.15);
 }

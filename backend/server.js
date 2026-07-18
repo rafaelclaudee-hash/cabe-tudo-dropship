@@ -15,6 +15,7 @@
  *   POST /api/auth/login                      → login (email, senha) → cookie de sessão (JWT httpOnly)
  *   GET  /api/auth/me                         → dados da conta logada (via cookie de sessão)
  *   POST /api/auth/logout                     → limpa o cookie de sessão
+ *   POST /api/newsletter/subscribe            → captura e-mail pra newsletter (idempotente, sem disparo de campanha)
  *   GET  /health                              → healthcheck
  */
 const { randomUUID, timingSafeEqual } = require('crypto');
@@ -1184,6 +1185,42 @@ app.post('/api/auth/logout', (req, res) => {
   const { maxAge, ...clearOptions } = sessionCookieOptions();
   res.clearCookie(SESSION_COOKIE_NAME, clearOptions);
   res.json({ ok: true });
+});
+
+/**
+ * Newsletter — só captura e armazena, sem disparo de campanha (envio é
+ * manual via Zoho Mail). Idempotente por email: inscrever de novo o
+ * mesmo email nunca é erro, só confirma (evita vazar se um email já
+ * está cadastrado, e evita duplicata sem o cliente precisar saber
+ * disso).
+ */
+app.post('/api/newsletter/subscribe', async (req, res) => {
+  const { email, aceite_lgpd, origem } = req.body || {};
+
+  if (!email || !EMAIL_FORMAT.test(email)) {
+    return res.status(400).json({ error: { code: 'INVALID_EMAIL', message: 'Email inválido' } });
+  }
+
+  if (aceite_lgpd !== true) {
+    return res.status(400).json({
+      error: { code: 'PRIVACY_NOT_ACCEPTED', message: 'É necessário aceitar receber e-mails e a Política de Privacidade' },
+    });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO newsletter_subscribers (email, aceite_lgpd, origem)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (email) DO NOTHING`,
+      [email, aceite_lgpd, origem || null]
+    );
+
+    req.log.info({ event: 'NEWSLETTER_SUBSCRIBED', origem }, 'Inscrição na newsletter');
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    req.log.error({ err }, 'Erro ao inscrever na newsletter');
+    res.status(500).json({ error: { code: 'INTERNAL' } });
+  }
 });
 
 /**
