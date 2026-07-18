@@ -8,6 +8,7 @@ import CartIcon from '@/components/CartIcon';
 import CartDrawer from '@/components/CartDrawer';
 import AccountLink from '@/components/AccountLink';
 import NewsletterForm from '@/components/NewsletterForm';
+import MetaPixel from '@/components/MetaPixel';
 import { CartProvider } from '@/lib/cart-context';
 import { AuthProvider } from '@/lib/auth-context';
 
@@ -32,6 +33,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="pt-BR" className={`${fraunces.variable} ${workSans.variable}`}>
       <body>
+        <MetaPixel />
         <AuthProvider>
         <CartProvider>
           <UtmCapture />
