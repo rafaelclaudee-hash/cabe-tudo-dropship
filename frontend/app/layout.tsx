@@ -104,6 +104,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                   <li><a href="#">Perguntas frequentes</a></li>
                   <li><Link href="/rastrear">Rastrear pedido</Link></li>
                   <li><Link href="/politica-de-privacidade">Política de Privacidade</Link></li>
+                  <li><Link href="/termos-de-uso">Termos de Uso</Link></li>
+                  <li><Link href="/politica-de-troca-devolucao">Política de Troca e Devolução</Link></li>
                 </ul>
               </div>
 
